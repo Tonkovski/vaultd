@@ -1,0 +1,22 @@
+# Payload staging. Library contents are never versioned; they move to the NAS later.
+/vault/
+
+# Machine-local config that points each library keeper at its library's location.
+*.local.toml
+
+# Python / uv
+.venv/
+.uv-cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Scratch
+/tmp/
+/.tmp/
+
+# Agent / editor local state
+.agents/
+.claude/settings.local.json

@@ -1,0 +1,9 @@
+# Library locator. Copy to vaultd.local.toml (gitignored) and adjust.
+# Resolution: a vault named N lives at overrides[N] if set, else root/N.
+
+# Every vault dir is assumed to rest inside root.
+root = "E:/vaultd/vault"
+
+# Relocated vaults only; keys are vault names as declared in datmeta.xml.
+[overrides]
+# NX-Digital = "//nas/vaultd/NX-Digital"

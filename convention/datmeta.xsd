@@ -1,0 +1,213 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="http://tonkovski.github.io/vaultd/datmeta"
+           xmlns="http://tonkovski.github.io/vaultd/datmeta"
+           xmlns:dm="http://tonkovski.github.io/vaultd/datmeta"
+           elementFormDefault="qualified">
+
+  <xs:simpleType name="VaultNameType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[A-Za-z0-9][A-Za-z0-9._-]*"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="StampType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9]{8}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="CompressionType">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="none"/>
+      <xs:enumeration value="7z"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="DateLooseType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9]{4}(-(0[1-9]|1[0-2])(-(0[1-9]|[12][0-9]|3[01]))?)?"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="PathSegmentType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[^/\\:*?&quot;&lt;&gt;|.][^/\\:*?&quot;&lt;&gt;|]*"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="RelPathType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[^/\\:*?&quot;&lt;&gt;|.][^/\\:*?&quot;&lt;&gt;|]*(/[^/\\:*?&quot;&lt;&gt;|.][^/\\:*?&quot;&lt;&gt;|]*)*"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="CrcType">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9A-F]{8}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Md5Type">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9a-f]{32}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:simpleType name="Sha1Type">
+    <xs:restriction base="xs:string">
+      <xs:pattern value="[0-9a-f]{40}"/>
+    </xs:restriction>
+  </xs:simpleType>
+
+  <xs:element name="vault">
+    <xs:complexType>
+      <xs:sequence>
+
+        <xs:element name="entities" minOccurs="0">
+          <xs:complexType>
+            <xs:sequence>
+              <xs:element name="entity" maxOccurs="unbounded">
+                <xs:complexType>
+                  <xs:sequence>
+
+                    <xs:element name="urls" minOccurs="0">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="url" type="xs:anyURI" maxOccurs="unbounded"/>
+                        </xs:sequence>
+                      </xs:complexType>
+                    </xs:element>
+
+                    <xs:element name="comment" type="xs:string" minOccurs="0"/>
+
+                    <xs:element name="releases" minOccurs="0">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="release" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:sequence>
+
+                                <xs:element name="fs" minOccurs="0">
+                                  <xs:complexType>
+                                    <xs:sequence>
+                                      <xs:element name="dir" minOccurs="0" maxOccurs="unbounded">
+                                        <xs:complexType>
+                                          <xs:attribute name="path" type="RelPathType" use="required"/>
+                                        </xs:complexType>
+                                      </xs:element>
+                                      <xs:element name="fileshared" minOccurs="0" maxOccurs="unbounded">
+                                        <xs:complexType>
+                                          <xs:attribute name="path" type="RelPathType"     use="required"/>
+                                          <xs:attribute name="size" type="xs:unsignedLong" use="required"/>
+                                          <xs:attribute name="crc"  type="CrcType"         use="required"/>
+                                          <xs:attribute name="md5"  type="Md5Type"         use="required"/>
+                                          <xs:attribute name="sha1" type="Sha1Type"        use="required"/>
+                                        </xs:complexType>
+                                      </xs:element>
+                                      <xs:element name="fileinstance" minOccurs="0" maxOccurs="unbounded">
+                                        <xs:complexType>
+                                          <xs:attribute name="path"     type="RelPathType" use="required"/>
+                                          <xs:attribute name="size"     type="xs:unsignedLong"/>
+                                          <xs:attribute name="required" type="xs:boolean" default="false"/>
+                                        </xs:complexType>
+                                      </xs:element>
+                                    </xs:sequence>
+                                  </xs:complexType>
+                                </xs:element>
+
+                                <xs:element name="pix" minOccurs="0">
+                                  <xs:complexType>
+                                    <xs:sequence>
+                                      <xs:element name="item" maxOccurs="unbounded">
+                                        <xs:complexType>
+                                          <xs:attribute name="name" type="PathSegmentType" use="required"/>
+                                          <xs:attribute name="note" type="xs:string"/>
+                                        </xs:complexType>
+                                      </xs:element>
+                                    </xs:sequence>
+                                  </xs:complexType>
+                                  <xs:unique name="UniquePixItemName">
+                                    <xs:selector xpath="dm:item"/>
+                                    <xs:field xpath="@name"/>
+                                  </xs:unique>
+                                </xs:element>
+
+                              </xs:sequence>
+                              <xs:attribute name="version"    type="PathSegmentType" use="required"/>
+                              <xs:attribute name="date"       type="DateLooseType"/>
+                              <xs:attribute name="standalone" type="xs:boolean" default="true"/>
+                            </xs:complexType>
+                            <xs:unique name="UniqueReleasePath">
+                              <xs:selector xpath="dm:fs/dm:dir|dm:fs/dm:fileshared|dm:fs/dm:fileinstance"/>
+                              <xs:field xpath="@path"/>
+                            </xs:unique>
+                          </xs:element>
+                        </xs:sequence>
+                      </xs:complexType>
+                      <xs:unique name="UniqueReleaseVersion">
+                        <xs:selector xpath="dm:release"/>
+                        <xs:field xpath="@version"/>
+                      </xs:unique>
+                    </xs:element>
+
+                    <xs:element name="patches" minOccurs="0">
+                      <xs:complexType>
+                        <xs:sequence>
+                          <xs:element name="patch" maxOccurs="unbounded">
+                            <xs:complexType>
+                              <xs:sequence>
+                                <xs:element name="file" maxOccurs="unbounded">
+                                  <xs:complexType>
+                                    <xs:attribute name="path" type="RelPathType"     use="required"/>
+                                    <xs:attribute name="size" type="xs:unsignedLong" use="required"/>
+                                    <xs:attribute name="crc"  type="CrcType"         use="required"/>
+                                    <xs:attribute name="md5"  type="Md5Type"         use="required"/>
+                                    <xs:attribute name="sha1" type="Sha1Type"        use="required"/>
+                                  </xs:complexType>
+                                </xs:element>
+                              </xs:sequence>
+                              <xs:attribute name="name"     type="PathSegmentType" use="required"/>
+                              <xs:attribute name="author"   type="xs:string"/>
+                              <xs:attribute name="revision" type="xs:string"/>
+                              <xs:attribute name="website"  type="xs:anyURI"/>
+                              <xs:attribute name="target"   type="PathSegmentType"/>
+                            </xs:complexType>
+                            <xs:unique name="UniquePatchFilePath">
+                              <xs:selector xpath="dm:file"/>
+                              <xs:field xpath="@path"/>
+                            </xs:unique>
+                          </xs:element>
+                        </xs:sequence>
+                      </xs:complexType>
+                      <xs:unique name="UniquePatchName">
+                        <xs:selector xpath="dm:patch"/>
+                        <xs:field xpath="@name"/>
+                      </xs:unique>
+                    </xs:element>
+
+                  </xs:sequence>
+                  <xs:attribute name="identifier"  type="PathSegmentType" use="required"/>
+                  <xs:attribute name="description" type="xs:string"/>
+                  <xs:attribute name="publisher"   type="xs:string"/>
+                  <xs:attribute name="developer"   type="xs:string"/>
+                </xs:complexType>
+              </xs:element>
+            </xs:sequence>
+          </xs:complexType>
+          <xs:unique name="UniqueEntityIdentifier">
+            <xs:selector xpath="dm:entity"/>
+            <xs:field xpath="@identifier"/>
+          </xs:unique>
+        </xs:element>
+
+      </xs:sequence>
+      <xs:attribute name="name"        type="VaultNameType"   use="required"/>
+      <xs:attribute name="version"     type="StampType"       use="required"/>
+      <xs:attribute name="author"      type="xs:string"/>
+      <xs:attribute name="description" type="xs:string"/>
+      <xs:attribute name="compression" type="CompressionType" use="required"/>
+    </xs:complexType>
+  </xs:element>
+
+</xs:schema>

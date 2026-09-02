@@ -1,0 +1,12 @@
+[project]
+name = "vaultd"
+version = "0.1.0"
+description = "VaultD archive bookkeeping: overwatch verification and sokoban keepers"
+requires-python = ">=3.12"
+dependencies = [
+    "lxml>=5.0",
+    "py7zr>=0.20",
+]
+
+[tool.uv]
+package = false
