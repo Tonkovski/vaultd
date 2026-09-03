@@ -60,6 +60,7 @@ class Patch:
 @dataclass(frozen=True)
 class Entity:
     identifier: str
+    description: str | None
     releases: tuple[Release, ...]
     patches: tuple[Patch, ...]
 
@@ -143,6 +144,7 @@ def load(path: Path) -> Catalog:
                     ))
             entities.append(Entity(
                 identifier=_req(path, ent_el, "identifier"),
+                description=ent_el.get("description"),
                 releases=tuple(releases),
                 patches=tuple(patches),
             ))

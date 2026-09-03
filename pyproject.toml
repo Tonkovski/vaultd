@@ -5,7 +5,9 @@ description = "VaultD archive bookkeeping: overwatch verification and sokoban ke
 requires-python = ">=3.12"
 dependencies = [
     "lxml>=5.0",
+    "nsz>=4.6.1",
     "py7zr>=0.20",
+    "pycryptodomex>=3.19",
 ]
 
 [tool.uv]

@@ -34,6 +34,15 @@ def resolve_vaults(ns: argparse.Namespace) -> dict[str, Path] | None:
     return vaults
 
 
+def fmt_size(n: int) -> str:
+    value = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{n} B"
+
+
 class Report:
     """Per-vault findings accumulator."""
 

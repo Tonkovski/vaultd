@@ -7,6 +7,15 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOCATOR = REPO_ROOT / "vaultd.local.toml"
+DB_ROOT = REPO_ROOT / "db"
+DROPZONE = REPO_ROOT / "dropzone"
+
+
+def _anchored(value: str, base: Path) -> Path:
+    """Locator paths: absolute stays as given, relative anchors to the toml
+    file's own directory — never to the process working directory."""
+    path = Path(value)
+    return path if path.is_absolute() else base / path
 
 
 class LocatorError(RuntimeError):
@@ -24,8 +33,10 @@ def load(locator: Path | None = None) -> tuple[Path, dict[str, Path]]:
         raise LocatorError(f"{path}: {exc}") from exc
     if "root" not in data:
         raise LocatorError(f"{path}: missing required key 'root'")
-    root = Path(data["root"])
-    overrides = {name: Path(loc) for name, loc in data.get("overrides", {}).items()}
+    base = path.resolve().parent
+    root = _anchored(data["root"], base)
+    overrides = {name: _anchored(loc, base)
+                 for name, loc in data.get("overrides", {}).items()}
     return root, overrides
 
 

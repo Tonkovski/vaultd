@@ -31,6 +31,14 @@ def format_line(entry: Entry) -> str:
     return f"{entry.crc} {entry.md5} {entry.sha1} {entry.size} {entry.path}"
 
 
+def write_file(path: Path, entries: dict[str, Entry]) -> None:
+    """Write entries sorted by path (Ordering rule), atomically."""
+    payload = "".join(format_line(entries[key]) + "\n" for key in sorted(entries))
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8", newline="\n")
+    tmp.replace(path)
+
+
 def parse_file(path: Path) -> tuple[dict[str, Entry], list[str]]:
     """Parse entities.checksum -> ({path: Entry}, [problems])."""
     entries: dict[str, Entry] = {}

@@ -42,6 +42,24 @@ Every vault carries exactly two bookkeeping files:
    container truth lives in the checksum. The container is a transport wrapper
    and is opaque — no attempt is made to make it byte-reproducible.
 
+## Ordering
+
+Every list-like sequence is sorted alphabetically (codepoint order) by its
+main key, wherever it is written:
+
+* `<entities>`: by `identifier`
+* `<releases>`: by `version`
+* `<fs>` children: kind grouping (dir, fileshared, fileinstance) is
+  structural; within each kind, by `path`
+* `<urls>`: by URL text
+* `<pix>` items: by `name`
+* `<patches>`: by `name`; patch `<file>` entries by `path`
+* `entities.checksum`: lines by `path`
+* tool listings and reports: same rule
+
+Writers (initvault, ingest) always produce sorted documents; a manual edit
+that breaks order is repaired by the next writer touching the file.
+
 ## Vault attributes
 
 | attribute     | meaning                                                        |
@@ -90,18 +108,50 @@ plain directory tree in every vault, and its files appear individually in
 
 ## Ingest contract
 
-A compressed archive is never a foreign object. Raw content enters via the
-dropzone; **ingest is the sole creator and the first auditor** of everything
-under `entities/`:
+A compressed archive is never a foreign object. Raw content enters only
+through the workspace `dropzone/` (runtime-side, fast disk) — ingest takes no
+source parameter; a keeper may designate a fixed sub-area within the dropzone
+as its intake. **Ingest is the sole creator and the first auditor** of
+everything under `entities/`:
 
-1. compute the full trio on the raw content — these become the XML
+1. refuse names unfit for the vault: V2 violations and case-twin collisions
+   (paths differing only in letter case) never pass the gate — name hygiene
+   is ingest's duty, not a downstream repair;
+2. compute the full trio on the raw content — these become the XML
    declarations;
-2. pack with the pinned toolchain (compressed vaults);
-3. audit its own product: read back the archive member table — paths, sizes,
-   CRC32s — against step 1;
-4. enroll: write the XML entry and the `entities.checksum` line(s).
+3. pack with the pinned toolchain (compressed vaults);
+4. audit its own product: read back the archive member table — paths, sizes,
+   CRC32s — against step 2;
+5. enroll: write the XML entry and the `entities.checksum` line(s).
 
 No lane exists for accepting an archive that ingest did not build.
+
+## Batch discipline
+
+Every batch tool is written so that the worst interruption — a Ctrl+C at any
+instant — is recoverable by simply running the tool again; the next run
+carries on silently. The trick: each element of the batch loop is linear and
+self-contained, in this order:
+
+1. metadata work (network lookups, decisions) — no disk mutation yet;
+2. payload lands under `entities/` as a **copy**; the dropzone source stays;
+3. bookkeeping checkpoint: `entities.checksum`, then `datmeta.xml` (each
+   written atomically), then the self-audit;
+4. the dropzone source is removed — **last**.
+
+An interruption anywhere before 4 leaves the source in the dropzone, so the
+next run redoes the element: an unrecorded leftover under `entities/` is
+overwritten; bytes already enrolled identically just complete step 4 by
+removing the source. No step depends on a later one, and the next target
+starts only after the previous element finished or failed whole.
+
+Remote hiccups are failures, not warnings: a batch element whose metadata
+work fails is skipped whole, its source untouched.
+
+Elements stay linear even when a phase could parallelize: batched
+pre-compression (nsz --multi) was considered and rejected as too risky —
+the mature archival tools (RomVault et al.) are linear for good reason.
+Wall-clock is the accepted price of a loop whose every state is legible.
 
 ## Audit tiers (overwatch)
 

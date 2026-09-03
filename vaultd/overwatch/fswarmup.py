@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from pathlib import Path
 
 from vaultd import checksum, hashing
@@ -60,13 +61,21 @@ def _verify_vault(name: str, vdir: Path, speed: int) -> tuple[bool, int]:
     else:
         files = _walk_files(entities_dir)
 
+    total_bytes = sum(entry.size for entry in entries.values())
+    print(f"== {name} ==")
+    print(f"  checksum: {len(entries)} line(s), {_common.fmt_size(total_bytes)}"
+          f"   disk: {len(files)} file(s)   speed: {speed}")
+
     for rel in sorted(entries.keys() - files.keys()):
         report.error(f"missing on disk: {rel}")
     for rel in sorted(files.keys() - entries.keys()):
         report.error(f"extra on disk: {rel}")
 
     fields = _SPEED_FIELDS[speed]
-    for rel in sorted(entries.keys() & files.keys()):
+    common = sorted(entries.keys() & files.keys())
+    hashed_bytes = 0
+    started = time.monotonic()
+    for index, rel in enumerate(common, 1):
         entry = entries[rel]
         try:
             actual_size = files[rel].stat().st_size
@@ -79,16 +88,23 @@ def _verify_vault(name: str, vdir: Path, speed: int) -> tuple[bool, int]:
             continue
         if not fields:
             continue
+        print(f"  [{index}/{len(common)}] {rel} ({_common.fmt_size(entry.size)})")
         try:
             actual = hashing.digest(files[rel], crc="crc" in fields,
                                     md5="md5" in fields, sha1="sha1" in fields)
         except OSError as exc:
             report.error(f"cannot read: {rel}: {exc}")
             continue
+        hashed_bytes += actual_size
         for field in fields:
             if actual[field] != getattr(entry, field):
                 report.error(f"{field} mismatch: {rel}: "
                              f"recorded {getattr(entry, field)}, actual {actual[field]}")
+    if fields and hashed_bytes:
+        elapsed = time.monotonic() - started
+        rate = hashed_bytes / elapsed if elapsed > 0 else 0
+        print(f"  hashed {_common.fmt_size(hashed_bytes)} in {elapsed:.1f}s "
+              f"({_common.fmt_size(int(rate))}/s)")
 
     return report.emit(f"{len(files)} file(s), speed {speed}"), len(files)
 

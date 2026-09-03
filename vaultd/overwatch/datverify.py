@@ -223,6 +223,18 @@ def _verify_vault(name: str, vdir: Path) -> bool:
         report.error(f"V1 catalog name '{cat.name}' != vault directory '{vdir.name}'")
     _lint_paths(cat, report)
 
+    n_rel = sum(len(e.releases) for e in cat.entities)
+    shared = [f for e in cat.entities for r in e.releases for f in r.shared]
+    n_inst = sum(len(r.instances) for e in cat.entities for r in e.releases)
+    n_pix = sum(len(r.pix_items) for e in cat.entities for r in e.releases)
+    pfiles = [f for e in cat.entities for p in e.patches for f in p.files]
+    print(f"== {name} ==")
+    print(f"  entities: {len(cat.entities)}   releases: {n_rel}   "
+          f"fileshared: {len(shared)} ({_common.fmt_size(sum(f.size for f in shared))})")
+    print(f"  fileinstance decls: {n_inst}   pix items: {n_pix}   "
+          f"patch files: {len(pfiles)} ({_common.fmt_size(sum(f.size for f in pfiles))})"
+          f"   compression: {cat.compression}")
+
     entries, problems = checksum.parse_file(vdir / "entities.checksum")
     for problem in problems:
         report.error(problem)
@@ -248,6 +260,7 @@ def _verify_vault(name: str, vdir: Path) -> bool:
 
     for path in consumer.leftovers():
         report.error(f"recorded but not declared: {path}")
+    print(f"  checksum: {len(consumer.consumed)}/{len(entries)} line(s) consumed")
 
     n_ent = len(cat.entities)
     return report.emit(f"{n_ent} entit{'y' if n_ent == 1 else 'ies'}, "

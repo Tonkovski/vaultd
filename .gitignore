@@ -1,6 +1,12 @@
 # Payload staging. Library contents are never versioned; they move to the NAS later.
 /vault/
 
+# Per-vault metadata feed caches (refreshable via sokoban dbsync); never versioned.
+/db/
+
+# Public dropzone: raw inputs awaiting a keeper; never versioned.
+/dropzone/
+
 # Machine-local config that points each library keeper at its library's location.
 *.local.toml
 
@@ -16,6 +22,7 @@ dist/
 # Scratch
 /tmp/
 /.tmp/
+*.bak
 
 # Agent / editor local state
 .agents/

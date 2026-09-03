@@ -16,11 +16,21 @@ vaultd/                    repo root (E:\vaultd)
       dlsite_digital/
     overwatch/             verification layer (warmup, audits, semantics V1-V4)
   vault/                   payload staging, gitignored; destined for the NAS
+  dropzone/                THE dropzone, gitignored: all pre-ingest material
+                           and keeper intakes live runtime-side (fast disk);
+                           vault storage stays dumb bulk (slow disk / NAS)
+  db/
+    <vault-name>/          metadata feed cache for one vault, gitignored;
+                           populated by python -m vaultd.sokoban.<vault>.dbsync
   vaultd.local.toml        machine-local library locator, gitignored
 ```
 
-Package directory names use `_` where a vault name uses `-` (Python module
-names cannot contain `-`).
+Feeds are cache, not custody: re-downloadable third-party data that informs
+keeper decisions but is never protected by catalog or checksum.
+
+A keeper's vault is bound by the locator toml alone: `overrides[<module
+name>]` if set, else `root/<module name>`. Vault directory names therefore
+equal keeper module names by default — no mapping rule exists.
 
 ## Library locator (`vaultd.local.toml`)
 
@@ -35,7 +45,23 @@ NX-Digital = "//nas/vaultd/NX-Digital"
 
 Resolution: a vault named `N` lives at `overrides[N]` if set, else `root/N`.
 Keys in `[overrides]` are vault names as declared in `datmeta.xml`. Paths use
-forward slashes.
+forward slashes; a relative path resolves against the directory holding the
+toml file (the repo root, in the standard setup).
+
+## Path resolution rule
+
+The runtime is always a git checkout: the repo root is derived from the
+package's own location, and the package is never installed as a distribution
+(`package = false` in pyproject.toml is doctrine, not accident). Every module
+must be callable from any working directory (repo root on `sys.path`, e.g.
+`python -m` from the root, or via PYTHONPATH):
+
+* No default path may depend on the process working directory. Defaults
+  anchor to the repo root or to the locator.
+* Relative paths inside a locator toml resolve against the directory holding
+  that toml.
+* Relative paths supplied on a command line resolve against the caller's
+  working directory — that is caller intent.
 
 ## Library
 
@@ -45,16 +71,17 @@ the payload, so a library survives without the repo.
 
 ```text
 <vault-name>/
-  db/                      trusted offline metadata feeds (keeper-owned layout)
-  dropzone/                raw inputs, experiments, quarantine (keeper-owned)
   entities/                the only required storage root for archived payload
   ezaccess/                generated human-friendly view; derived, disposable
   datmeta.xml              declared catalog (see datmeta.md)
   entities.checksum        physical mirror   (see datmeta.md)
 ```
 
-* `db/` and `dropzone/` internal structure is owned by that vault's keeper
-  scripts, not by this convention.
+* Pre-ingest material never lives in the vault: the workspace `dropzone/` is
+  the sole intake, and its internal structure (keeper sub-areas included) is
+  keeper-owned, not fixed by this convention.
+* Metadata feeds live outside the vault too, under the workspace
+  `db/<vault-name>/` (see Workspace above).
 * `ezaccess/` is regenerable from catalog + entities at any time and is never
   part of truth. Deleting it loses nothing. (Link mechanism to be redesigned
   with SMB/NAS in mind.)
