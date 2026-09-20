@@ -43,15 +43,23 @@ REGION_PRIORITY = [
 
 
 class TitleDB:
-    """Lazy region-json reader: query(title_id) -> (name, publisher, region)."""
+    """Lazy region-json reader: query(title_id) -> (name, publisher, region).
 
-    def __init__(self, dirpath: Path) -> None:
+    `priority` overrides the lookup sequence for this instance; None means
+    the project-wide REGION_PRIORITY. Keepers that personalize presentation
+    build their sequence locally and pass it here — the ladder constant
+    itself is never edited per script.
+    """
+
+    def __init__(self, dirpath: Path,
+                 priority: list[str] | None = None) -> None:
         self.dir = Path(dirpath)
+        self.priority = list(priority) if priority is not None else REGION_PRIORITY
         self._cache: dict[str, dict[str, tuple[str, str]]] = {}
 
     def available(self) -> bool:
         return any((self.dir / f"{region}.json").exists()
-                   for region in REGION_PRIORITY)
+                   for region in self.priority)
 
     def _region(self, region: str) -> dict[str, tuple[str, str]]:
         if region in self._cache:
@@ -77,7 +85,7 @@ class TitleDB:
 
     def query(self, title_id: str) -> tuple[str | None, str | None, str | None]:
         tid = title_id.upper()
-        for region in REGION_PRIORITY:
+        for region in self.priority:
             hit = self._region(region).get(tid)
             if hit and hit[0]:
                 return hit[0], hit[1], region

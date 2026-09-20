@@ -63,6 +63,7 @@ class Entity:
     description: str | None
     releases: tuple[Release, ...]
     patches: tuple[Patch, ...]
+    comment: str | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,7 @@ def load(path: Path) -> Catalog:
                 description=ent_el.get("description"),
                 releases=tuple(releases),
                 patches=tuple(patches),
+                comment=ent_el.findtext(_t("comment")),
             ))
 
     return Catalog(

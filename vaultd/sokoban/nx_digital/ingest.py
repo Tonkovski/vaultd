@@ -17,9 +17,10 @@ Storage lanes:
   * hashdb clean match  -> archival NSZ (nsz -C -K -l 22 -t 16), decompressed
                            and sha1-verified against the source before
                            enrollment; stored [tid][vN][TYPE].nsz
-  * [GAMECARD] variant  -> bypasses hashdb (filename+CNMT identity must
-                           agree); same NSZ round-trip; [..][GAMECARD].nsz
-  * --force LABEL miss  -> bare NSP preserved as [..][TYPE][LABEL].nsp
+  * [GAMECARD] variant  -> no positive hashdb match required; known rejected
+                           hashes still quarantine; same NSZ round-trip
+  * --force LABEL       -> bypass every hashdb verdict (including clean and
+                           rejected matches); bare NSP as [..][TYPE][LABEL].nsp
 Admission priority for one (entity, version): vanilla > [GAMECARD] > [custom
 label]; distinct customs coexist; the same marker with different bytes is a
 conflict (left in place, resolve by hand).
@@ -52,7 +53,7 @@ VER_RE = re.compile(r"\[(v\d+)\]")
 TYPE_RE = re.compile(r"\[(BASE|UPD|DLC)\]", re.IGNORECASE)
 MARKER_RE = re.compile(r"\[([A-Za-z0-9][A-Za-z0-9_-]*)\]")
 LABEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
-REJECT_ROW_RE = re.compile(r"\[[bh][^\]]*\]", re.IGNORECASE)
+REJECT_ROW_RE = re.compile(r"\[(?:b|h)\d*\]", re.IGNORECASE)
 TYPE_BY_CNMT = {0x80: "BASE", 0x81: "UPD", 0x82: "DLC"}
 
 
@@ -108,17 +109,46 @@ def load_hashdb(hashdb: Path) -> dict[str, dict[str, bool]]:
         root = ET.parse(dat).getroot()
         for game in root.iter("game"):
             name = game.get("name") or ""
-            reject = bool(REJECT_ROW_RE.search(name))
+            reject = bool(REJECT_ROW_RE.search(name)) or any(
+                (game.findtext(flag) or "").strip().lower() in {"true", "1"}
+                for flag in ("isHack", "isBadTicket"))
             for rom in game.iter("rom"):
                 sha1 = rom.get("sha1")
                 if not sha1:
                     continue
-                status = (rom.get("status") or "").lower()
-                row_reject = reject or status in {"baddump", "hacked"}
+                status = (rom.get("status") or "").strip().lower()
+                row_reject = (reject or status in {"baddump", "hacked"}
+                              or bool(REJECT_ROW_RE.search(rom.get("name") or "")))
                 rows = lookup.setdefault(sha1.lower(), {})
                 rows[name] = rows.get(name, False) or row_reject
     print(f"  {len(lookup)} rom hashes indexed")
     return lookup
+
+
+def admission_marker(subject_sha1: str, gate: dict[str, dict[str, bool]],
+                     incoming_gamecard: bool, force_label: str | None,
+                     identity: str, warnings: list[str]) -> str:
+    """Explicit force overrides the database; ordinary ingest rejects any bad hit."""
+    if force_label is not None:
+        print(f"  gate:   --force [{force_label}], hashdb bypassed")
+        return force_label
+    rows = gate.get(subject_sha1, {})
+    rejected = sorted(name for name, reject in rows.items() if reject)
+    if rejected:
+        raise Skip("quarantined", "hashdb rejection row(s): " + "; ".join(rejected))
+    if incoming_gamecard:
+        print("  gate:   [GAMECARD] variant, positive hashdb match not required")
+        return "GAMECARD"
+    clean = sorted(rows)
+    if not clean:
+        raise Skip("undecided", "hashdb miss; left in dropzone (fresher dat, or --force LABEL)")
+    if len(clean) > 1:
+        warn = (f"{identity} sha1 claimed by {len(clean)} distinct clean hashdb rows:\n"
+                + "\n".join(f"        - {name}" for name in clean))
+        warnings.append(warn)
+        print(f"  WARN: {warn}")
+    print(f"  hashdb: {clean[0]}")
+    return ""
 
 
 def stored_marker(filename: str) -> str | None:
@@ -161,7 +191,8 @@ def cross_check(tid: str, ver: str, type_name: str, info) -> None:
 # nsz is invoked via `python -c`, never via its console-script .exe shim:
 # the shim breaks nsz's multiprocessing worker spawn chain on Windows when
 # the parent's standard handles are redirected (WaitNamedPipe failures).
-_NSZ_BOOTSTRAP = "import sys; from nsz import main; sys.argv[0] = 'nsz'; main()"
+_NSZ_BOOTSTRAP = ("import sys; from vaultd.sokoban.nx_digital.nsz_codec import main; "
+                  "sys.argv[0] = 'nsz'; main()")
 
 
 def run_nsz(args: list[str]) -> None:
@@ -287,7 +318,7 @@ def self_audit(xml_path: Path) -> list[str]:
 
 def ingest_one(source: Path, work_root: Path, root: ET.Element,
                entries: dict[str, checksum.Entry], vdir: Path,
-               gate: dict[str, list[tuple[str, bool]]], titledb: TitleDB | None,
+               gate: dict[str, dict[str, bool]], titledb: TitleDB | None,
                keys: KeySet, force_label: str | None,
                warnings: list[str]) -> str:
     parsed = parse_name(source)
@@ -320,36 +351,8 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
     subject_sha1 = str(subject_digest["sha1"]).lower()
 
     # --- admission gate ---
-    if incoming_gamecard and force_label is None:
-        marker = "GAMECARD"
-        print("  gate:   [GAMECARD] variant, hashdb bypassed")
-    else:
-        rows = gate.get(subject_sha1)
-        if rows is not None:
-            clean = sorted(name for name, reject in rows.items() if not reject)
-            rejected = sorted(name for name, reject in rows.items() if reject)
-            if not clean:
-                raise Skip("quarantined",
-                           "hashdb rejection row(s): " + "; ".join(rejected))
-            if rejected:
-                warnings.append(f"[{tid}][{ver}][{type_name}] sha1 also matches "
-                                "rejection row(s):\n"
-                                + "\n".join(f"        - {name}" for name in rejected))
-            if len(clean) > 1:
-                warn = (f"[{tid}][{ver}][{type_name}] sha1 claimed by "
-                        f"{len(clean)} distinct clean hashdb rows:\n"
-                        + "\n".join(f"        - {name}" for name in clean))
-                warnings.append(warn)
-                print(f"  WARN: {warn}")
-            print(f"  hashdb: {clean[0]}")
-            marker = ""
-        elif force_label is not None:
-            marker = force_label
-            print(f"  hashdb: miss -- force-enroll with [{marker}] marker")
-        else:
-            raise Skip("undecided",
-                       "hashdb miss; left in dropzone (fresher dat, or "
-                       "--force LABEL)")
+    marker = admission_marker(subject_sha1, gate, incoming_gamecard, force_label,
+                              f"[{tid}][{ver}][{type_name}]", warnings)
 
     # --- decision matrix against the enrolled release ---
     entity_tid = entity_for(tid, type_name)
@@ -391,10 +394,6 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
         suffix_marker = "[GAMECARD]" if marker == "GAMECARD" else ""
         stored_name = f"[{tid}][{ver}][{type_name}]{suffix_marker}.nsz"
     else:
-        if source.suffix.lower() == ".nsz":
-            raise Skip("failed",
-                       "labeled artifacts are preserved as bare NSP; "
-                       "decompress this NSZ first")
         artifact = subject
         stored_name = f"[{tid}][{ver}][{type_name}][{marker}].nsp"
 
@@ -454,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--copy", action="store_true",
                         help="keep dropzone sources instead of removing them on success")
     parser.add_argument("--force", metavar="LABEL", default=None,
-                        help="force-enroll hashdb-miss artifacts with the "
+                        help="bypass all hashdb verdicts with the "
                              "[LABEL] filename marker (bare NSP preserved)")
     parser.add_argument("--keys", type=Path,
                         default=Path.home() / ".switch" / "prod.keys")
@@ -479,13 +478,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: missing {xml_path}", file=sys.stderr)
         return 2
     hashdb_dir = DB_DIR / "hashdb"
-    if not any(hashdb_dir.glob("*.xml")):
+    if args.force is None and not any(hashdb_dir.glob("*.xml")):
         print(f"ERROR: no hashdb dats under {hashdb_dir}; run dbsync / add dats",
               file=sys.stderr)
         return 2
 
     keys = KeySet.load(args.keys)
-    gate = load_hashdb(hashdb_dir)
+    gate = load_hashdb(hashdb_dir) if args.force is None else {}
     titledb = TitleDB(DB_DIR / "titledb")
     if titledb.available():
         print(f"titledb: {DB_DIR / 'titledb'}")

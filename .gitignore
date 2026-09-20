@@ -1,29 +1,26 @@
-# Payload staging. Library contents are never versioned; they move to the NAS later.
+# Local archive data and scratch
 /vault/
-
-# Per-vault metadata feed caches (refreshable via sokoban dbsync); never versioned.
 /db/
-
-# Public dropzone: raw inputs awaiting a keeper; never versioned.
 /dropzone/
+/testfield/
 
-# Machine-local config that points each library keeper at its library's location.
+# Machine-local configuration
 *.local.toml
 
-# Python / uv
-.venv/
-.uv-cache/
+# Python runtime
+/.venv/
 __pycache__/
 *.py[cod]
-*.egg-info/
-build/
-dist/
 
-# Scratch
-/tmp/
-/.tmp/
+# Local backups
 *.bak
+*.bak-*
 
-# Agent / editor local state
-.agents/
-.claude/settings.local.json
+# Archive payloads and console keys
+*.keys
+*.nca
+*.nsp
+*.nsz
+*.xci
+*.xcz
+*.tik

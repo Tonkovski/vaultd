@@ -21,8 +21,28 @@ import sys
 from pathlib import Path, PurePosixPath
 
 from vaultd import catalog, ezlink, locator
+from vaultd.locator import DB_ROOT
 from vaultd.sokoban.nx_digital import VAULT_NAME
 from vaultd.sokoban.nx_digital.nxlookup import classify
+from vaultd.titledb import REGION_PRIORITY, TitleDB
+
+# Personal display ladder for THIS tool only (shelf names). Independent
+# from nxlookup's ladder — the two are edited separately. Regions listed
+# here are consulted before the shared NACP-order spine (REGION_PRIORITY
+# in vaultd/titledb.py); the spine stays underneath as fallback so nothing
+# goes nameless. Edit to taste; empty keeps the project-wide order.
+# Presentation only — datmeta descriptions stay canonical.
+DISPLAY_REGION_PRIORITY: list[str] = [
+    "HK.zh", "CN.zh", "US.en", "GB.en", "JP.ja",
+    "AR.en", "AU.en", "BG.en", "BR.en", "CA.en", "CL.en", "CN.en", "CO.en",
+    "CY.en", "CZ.en", "DK.en", "EE.en", "FI.en", "GR.en", "HR.en", "HU.en",
+    "IE.en", "IL.en", "JP.en", "LT.en", "LV.en", "MT.en", "MX.en", "NO.en",
+    "NZ.en", "PE.en", "PL.en", "RO.en", "SE.en", "SI.en", "SK.en", "ZA.en",
+    "FR.fr", "DE.de", "MX.es", "ES.es", "IT.it", "NL.nl", "CA.fr", "PT.pt",
+    "RU.ru", "KR.ko", "BR.pt",
+]
+
+DB_DIR = DB_ROOT / VAULT_NAME
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -51,8 +71,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     ez.mkdir(exist_ok=True)
 
-    # group entities by application id; shelf name prefers the app entity's
-    # own description, then any group member's.
+    # group entities by application id; shelf name prefers this module's
+    # personal display ladder (DISPLAY_REGION_PRIORITY above), then the
+    # app entity's own description, then any group member's. Without a
+    # titledb on this machine the catalog descriptions carry the view.
+    names = TitleDB(DB_DIR / "titledb", priority=[
+        *DISPLAY_REGION_PRIORITY,
+        *[region for region in REGION_PRIORITY
+          if region not in DISPLAY_REGION_PRIORITY]])
+    lookup = names.available()
     groups: dict[str, list[catalog.Entity]] = {}
     for entity in cat.entities:
         _, app_id = classify(entity.identifier)
@@ -63,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         for app_id in sorted(groups):
             members = groups[app_id]
-            description = next(
+            description = (names.query(app_id)[0] if lookup else None) or next(
                 (member.description for member in members
                  if member.identifier == app_id and member.description),
                 None) or next(

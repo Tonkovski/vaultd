@@ -11,9 +11,10 @@ Intake default is the workspace dropzone's keeper sub-area dropzone/fixnsp;
 outputs publish to the dropzone ROOT — the digital ingest's scan surface, so
 repaired NSPs flow straight into enrollment. Fully successful sources are
 archived to dropzone/fixnsp-success. CNMTDB (db/nx_digital/titledb/cnmts.json) proposes
-Meta scalar candidates; when it is silent, db/nx_digital/firmware_versions.json
-(a JSON list of released-firmware requiredSystemVersion integers) bounds the
-fallback axis. Neither database can authorize output.
+Meta scalar candidates; firmware values observed elsewhere in CNMTDB and the
+optional db/nx_digital/firmware_versions.json (a JSON list of released-firmware
+requiredSystemVersion integers) bound the fallback axis. Neither database can
+authorize output.
 """
 
 from __future__ import annotations
@@ -92,7 +93,6 @@ NCA_HEADER_FIXED_KEY_MODULI = tuple(
 TITLE_TYPE_NAMES = {0x80: "BASE", 0x81: "UPD", 0x82: "DLC"}
 NCA_CONTENT_NAMES = {0: "PROGRAM", 1: "META", 2: "CONTROL", 3: "MANUAL",
                      4: "DATA", 5: "PUBLICDATA"}
-TITLE_BEARING_CNMT_TYPES = {1, 2}
 TITLE_BEARING_NCA_TYPES = {0, 4, 5}
 RECOVERABLE_TITLE_RIGHTS_NCA_TYPES = TITLE_BEARING_NCA_TYPES | {3}
 NCA_KEY_GENERATION_SINCE_301 = 3
@@ -898,6 +898,7 @@ def patch_cnmt_scalar_fields(payload: bytes, info: CnmtInfo,
 class CnmtKnowledgeBase:
     path: Path
     _records: dict[str, object] | None = field(default=None, init=False, repr=False)
+    _system_versions: tuple[int, ...] | None = field(default=None, init=False, repr=False)
 
     def _load(self) -> dict[str, object]:
         if self._records is None:
@@ -953,6 +954,19 @@ class CnmtKnowledgeBase:
                     and 0 <= candidate <= 0xFFFFFFFF and candidate != current):
                 candidates[name] = candidate
         return candidates
+
+    def system_version_candidates(self) -> tuple[int, ...]:
+        """Observed firmware values are proposals, never signature authority."""
+        if self._system_versions is None:
+            values = {
+                value
+                for versions in self._load().values() if isinstance(versions, dict)
+                for record in versions.values() if isinstance(record, dict)
+                if isinstance(value := record.get("requiredSystemVersion"), int)
+                and not isinstance(value, bool) and 0 <= value <= 0xFFFFFFFF
+            }
+            self._system_versions = tuple(sorted(values)[:1000])
+        return self._system_versions
 
 
 def load_firmware_catalog(path: Path) -> tuple[int, ...]:
@@ -1219,70 +1233,6 @@ def rebuild_meta_nca(source: Path, out_dir: Path, rewrites: list[NcaRewrite],
 # --------------------------------------------------------------------------
 # repair primitives
 
-def restore_title_rights_nca(source: Path, out_dir: Path, keys: KeySet,
-                             source_hash: str | None = None) -> NcaRewrite:
-    header = read_nca_header(source, keys)
-    if header.has_title_rights:
-        raise FixError(f"NCA already has title rights: {source.name}")
-    if header.is_gamecard or header.distribution_type != 0:
-        raise FixError(f"Gamecard NCA cannot establish an eShop titlekey: {source.name}")
-    if header.content_type not in TITLE_BEARING_NCA_TYPES:
-        raise FixError(f"NCA type is not eligible for title-rights restoration: {source.name}")
-    if header.decrypted_key_area is None:
-        raise FixError(f"NCA key area is unavailable: {source.name}")
-    titlekey = recoverable_key_area_titlekey(header.decrypted_key_area)
-    if titlekey is None:
-        raise FixError(f"ambiguous NCA key-area layout: {source.name}")
-
-    rights_generation = expected_rights_id_generation(header.key_generation)
-    rights_id = f"{header.title_id}{rights_generation:016x}".lower()
-    encrypted_titlekey = ecb_encrypt(keys.titlekek(header.master_key_index), titlekey)
-    raw = bytearray(header.raw)
-    raw[0x230:0x240] = bytes.fromhex(rights_id)
-    raw[0x300:0x340] = b"\0" * 0x40
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    temporary = out_dir / source.name
-    shutil.copy2(source, temporary)
-    write_nca_header(temporary, raw, keys)
-    old_hash = source_hash or sha256_file(source)
-    new_hash = sha256_file(temporary)
-    destination = out_dir / f"{new_hash[:32]}.nca"
-    if destination != temporary:
-        if destination.exists():
-            destination.unlink()
-        temporary.rename(destination)
-    return NcaRewrite(source=source, output=destination, old_hash=old_hash,
-                      old_id=old_hash[:32], new_hash=new_hash, new_id=new_hash[:32],
-                      rights_id=rights_id, encrypted_titlekey=encrypted_titlekey)
-
-
-def restore_gamecard_distribution_nca(source: Path, out_dir: Path, keys: KeySet,
-                                      source_hash: str | None = None) -> NcaRewrite | None:
-    header = read_nca_header(source, keys)
-    if (header.has_title_rights or header.distribution_type != 0
-            or header.decrypted_key_area is None):
-        return None
-    raw = bytearray(header.raw)
-    raw[0x204] = 1
-    if not nca_main_signature_valid(raw):
-        return None
-    old_hash = source_hash or sha256_file(source)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    temporary = out_dir / source.name
-    shutil.copy2(source, temporary)
-    write_nca_header(temporary, raw, keys)
-    new_hash = sha256_file(temporary)
-    suffix = ".cnmt.nca" if header.content_type == 1 else ".nca"
-    destination = out_dir / f"{new_hash[:32]}{suffix}"
-    if destination != temporary:
-        if destination.exists():
-            destination.unlink()
-        temporary.rename(destination)
-    return NcaRewrite(source=source, output=destination, old_hash=old_hash,
-                      old_id=old_hash[:32], new_hash=new_hash, new_id=new_hash[:32])
-
-
 # --------------------------------------------------------------------------
 # inspection dataclasses
 
@@ -1375,14 +1325,15 @@ def decision_hash(decision: NcaDecision) -> str:
 
 
 # --------------------------------------------------------------------------
-# noncanonical recovery: the bounded enumeration
+# header repair: the bounded enumeration
 
-def recover_noncanonical_nca(source: Path, source_hash: str, expected_id: str,
-                             header: NcaHeader, recovery_dir: Path, keys: KeySet,
-                             knowledge: CnmtKnowledgeBase | None,
-                             firmware_catalog: tuple[int, ...]) -> NcaArtifact | None:
+def enumerate_header_candidates(header: NcaHeader, keys: KeySet
+                                ) -> list[tuple[bytearray, str | None, bytes | None, str]]:
+    """The composed transform space: (raw header, rights id, encrypted
+    titlekey, reason) per candidate, each axis a deterministic inverse.
+    Empty for rights-bearing NCAs and unavailable key areas."""
     if header.has_title_rights or header.decrypted_key_area is None:
-        return None
+        return []
     titlekey = recoverable_key_area_titlekey(header.decrypted_key_area)
     candidates: list[tuple[bytearray, str | None, bytes | None, str]] = []
     if header.distribution_type == 0:
@@ -1420,6 +1371,140 @@ def recover_noncanonical_nca(source: Path, source_hash: str, expected_id: str,
                 "title-rights and crypto-generation restoration "
                 f"{header.key_generation} -> {generation} "
                 f"(RightsId title {rights_id[:16].upper()})"))
+    return candidates
+
+
+def meta_payload_candidates(meta: MetaPayload,
+                            knowledge: CnmtKnowledgeBase | None,
+                            firmware_catalog: tuple[int, ...],
+                            recovered_content: dict[str, NcaArtifact] | None = None):
+    """Compose supported CNMT inverses, preserving all unrelated payload bytes.
+
+    Some downgrades retain original content IDs but replace their full hashes
+    with hashes of the damaged files. Restore such a hash only from a signed
+    recovery that regained that exact ID and whose old hash matches the CNMT.
+    The containing Meta still has to regain its own Nintendo signature.
+    """
+    payloads = [(meta.payload, "")]
+    corrected = bytearray(meta.payload)
+    changed = 0
+    for entry in meta.info.content_entries:
+        artifact = (recovered_content or {}).get(entry.nca_id.lower())
+        if artifact is None or artifact.recovery is None:
+            continue
+        recovery = artifact.recovery
+        if (artifact.verification.main_signature_valid
+                and artifact.nca_id.lower() == entry.nca_id.lower()
+                and recovery.new_id.lower() == entry.nca_id.lower()
+                and recovery.new_hash[:32].lower() == entry.nca_id.lower()
+                and recovery.new_hash.lower() == artifact.sha256.lower()
+                and recovery.old_hash.lower() == entry.hash.lower()
+                and entry.size == artifact.path.stat().st_size
+                and entry.hash.lower() != artifact.sha256.lower()):
+            corrected[entry.offset:entry.offset + 0x20] = bytes.fromhex(artifact.sha256)
+            changed += 1
+    if changed:
+        payloads.append((bytes(corrected), f"restored {changed} CNMT content hash(es)"))
+
+    scalar_sets: list[tuple[dict[str, int], str]] = [({}, "")]
+    db_candidates = knowledge.scalar_candidates(meta.info) if knowledge is not None else {}
+    if db_candidates:
+        scalar_sets.append((db_candidates, "CNMTDB candidate"))
+    if "requiredSystemVersion" in meta.info.field_offsets:
+        observed = knowledge.system_version_candidates() if knowledge is not None else ()
+        for value in sorted(set(firmware_catalog) | set(observed)):
+            proposal = {"requiredSystemVersion": value}
+            if value != meta.info.required_system_version and proposal != db_candidates:
+                origin = ("firmware-catalog candidate" if value in firmware_catalog
+                          else "CNMTDB observed-system-version candidate")
+                scalar_sets.append((proposal, origin))
+
+    for payload, content_reason in payloads:
+        for scalars, origin in scalar_sets:
+            if not content_reason and not scalars:
+                continue  # Unchanged payload was already tried by the header lane.
+            patched, changes = patch_cnmt_scalar_fields(payload, meta.info, scalars)
+            scalar_reason = f"{origin} " + ", ".join(changes) if scalars else ""
+            reason = "; ".join(part for part in (content_reason, scalar_reason) if part)
+            yield patched, reason
+
+
+def restore_signed_header_nca(source: Path, out_dir: Path, keys: KeySet,
+                              source_hash: str | None = None,
+                              knowledge: CnmtKnowledgeBase | None = None,
+                              firmware_catalog: tuple[int, ...] = (),
+                              recovered_content: dict[str, NcaArtifact] | None = None
+                              ) -> tuple[NcaRewrite, str] | None:
+    """Best effort for a hash-consistent NCA whose main signature fails:
+    enumerate the composed transform space and accept the candidate whose
+    Nintendo main signature verifies. The signature alone is the oracle —
+    it pins exact bytes, so at most one candidate can pass; no expected id
+    exists because the file is hash-consistent exactly as shipped. For a
+    Meta NCA, exact recovered content hashes and CNMT scalar proposals compose
+    with the header axes: the section hash inside the signed header pins the
+    payload transitively. Title-specific proposals precede firmware values
+    observed elsewhere in CNMTDB or in the optional firmware catalog."""
+    header = read_nca_header(source, keys)
+    candidates = enumerate_header_candidates(header, keys)
+    # (raw header, restored plaintext section or None, rights id,
+    #  encrypted titlekey, reason)
+    winners: list[tuple[bytearray, bytes | None, str | None, bytes | None, str]] = []
+    for raw, rights_id, encrypted_titlekey, reason in candidates:
+        if nca_main_signature_valid(raw):
+            winners.append((raw, None, rights_id, encrypted_titlekey, reason))
+
+    meta = None
+    if not winners and header.content_type == 1:
+        meta = read_meta_payload(source, keys)
+        for patched_payload, payload_reason in meta_payload_candidates(
+                meta, knowledge, firmware_catalog, recovered_content):
+            for raw, rights_id, encrypted_titlekey, reason in candidates:
+                meta_plain, meta_raw = rebuild_meta_layers(
+                    meta, patched_payload, raw)
+                if nca_main_signature_valid(meta_raw):
+                    winners.append((meta_raw, meta_plain, rights_id,
+                                    encrypted_titlekey,
+                                    f"{reason}; {payload_reason}"))
+            if winners:
+                break
+
+    if not winners:
+        return None
+    if len({bytes(winner[0]) for winner in winners}) > 1:
+        raise FixError("multiple distinct signed header candidates "
+                       f"(cryptographically impossible): {source.name}")
+    raw, restored_plain, rights_id, encrypted_titlekey, reason = winners[0]
+    old_hash = source_hash or sha256_file(source)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    temporary = out_dir / source.name
+    shutil.copy2(source, temporary)
+    if restored_plain is not None:
+        write_nca_section(temporary, meta.section, restored_plain,
+                          nca_section_key(meta.header, keys))
+    write_nca_header(temporary, raw, keys)
+    new_hash = sha256_file(temporary)
+    suffix = ".cnmt.nca" if header.content_type == 1 else ".nca"
+    destination = out_dir / f"{new_hash[:32]}{suffix}"
+    if destination != temporary:
+        if destination.exists():
+            destination.unlink()
+        temporary.rename(destination)
+    rewrite = NcaRewrite(source=source, output=destination, old_hash=old_hash,
+                         old_id=old_hash[:32], new_hash=new_hash,
+                         new_id=new_hash[:32], rights_id=rights_id,
+                         encrypted_titlekey=encrypted_titlekey)
+    return rewrite, reason
+
+
+def recover_noncanonical_nca(source: Path, source_hash: str, expected_id: str,
+                             header: NcaHeader, recovery_dir: Path, keys: KeySet,
+                             knowledge: CnmtKnowledgeBase | None,
+                             firmware_catalog: tuple[int, ...],
+                             recovered_content: dict[str, NcaArtifact] | None = None
+                             ) -> NcaArtifact | None:
+    candidates = enumerate_header_candidates(header, keys)
+    if not candidates:
+        return None
 
     recovery_dir.mkdir(parents=True, exist_ok=True)
     probe = recovery_dir / f".{source.name}.candidate"
@@ -1436,22 +1521,9 @@ def recover_noncanonical_nca(source: Path, source_hash: str, expected_id: str,
 
         if not matches and header.content_type == 1:
             meta = read_meta_payload(source, keys)
-            scalar_sets: list[tuple[dict[str, int], str]] = []
-            if knowledge is not None:
-                db_candidates = knowledge.scalar_candidates(meta.info)
-                if db_candidates:
-                    scalar_sets.append((db_candidates, "CNMTDB candidate"))
-            if not scalar_sets and firmware_catalog and \
-                    "requiredSystemVersion" in meta.info.field_offsets:
-                for value in firmware_catalog:
-                    if value != meta.info.required_system_version:
-                        scalar_sets.append(
-                            ({"requiredSystemVersion": value}, "firmware-catalog candidate"))
             section_key = nca_section_key(meta.header, keys)
-            for scalar_candidates, origin in scalar_sets:
-                patched_payload, changes = patch_cnmt_scalar_fields(
-                    meta.payload, meta.info, scalar_candidates)
-                scalar_reason = f"{origin} " + ", ".join(changes)
+            for patched_payload, payload_reason in meta_payload_candidates(
+                    meta, knowledge, firmware_catalog, recovered_content):
                 for raw, rights_id, encrypted_titlekey, reason in candidates:
                     meta_plain, meta_raw = rebuild_meta_layers(meta, patched_payload, raw)
                     if not nca_main_signature_valid(meta_raw):
@@ -1462,7 +1534,7 @@ def recover_noncanonical_nca(source: Path, source_hash: str, expected_id: str,
                     if digest[:32].lower() != expected_id.lower():
                         continue
                     matches.append((meta_raw, digest, rights_id, encrypted_titlekey,
-                                    f"{reason}; {scalar_reason}", meta_plain))
+                                    f"{reason}; {payload_reason}", meta_plain))
                 if matches:
                     break
     finally:
@@ -1496,7 +1568,8 @@ def recover_noncanonical_nca(source: Path, source_hash: str, expected_id: str,
 
 # nsz via `python -c`, never its .exe shim (breaks multiprocessing spawn on
 # Windows under redirected standard handles).
-_NSZ_BOOTSTRAP = "import sys; from nsz import main; sys.argv[0] = 'nsz'; main()"
+_NSZ_BOOTSTRAP = ("import sys; from vaultd.sokoban.nx_digital.nsz_codec import main; "
+                  "sys.argv[0] = 'nsz'; main()")
 
 
 def decompress_nsz(source: Path, out_dir: Path) -> Path:
@@ -1607,16 +1680,22 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
             return
         artifacts[artifact.nca_id] = artifact
 
+    readable = []
     for path in sorted(scope_path.rglob("*.nca")):
         try:
             digest = sha256_file(path)
-            digest_id = digest[:32]
             header = read_nca_header(path, keys)
         except (FixError, OSError, ValueError) as exc:
             detail = f"unreadable NCA left unused: {path.name}: {exc}"
             (failed_meta_attempts if path.name.lower().endswith(".cnmt.nca")
              else warnings).append(detail)
             continue
+        readable.append((path, digest, header))
+    # Meta recovery may need the signed content recoveries, irrespective of
+    # filename order or whether a Meta wrapper has the .cnmt.nca suffix.
+    for path, digest, header in sorted(
+            readable, key=lambda item: (item[2].content_type == 1, item[0])):
+        digest_id = digest[:32]
         verification = NcaVerification(path, nca_main_signature_valid(header.raw))
         filename_id = path.stem.split(".", 1)[0].lower()
         if filename_id == digest_id:
@@ -1640,7 +1719,7 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
             try:
                 recovered = recover_noncanonical_nca(
                     path, digest, filename_id, header, recovery_dir, keys,
-                    knowledge, firmware_catalog)
+                    knowledge, firmware_catalog, artifacts)
             except (FixError, OSError, ValueError):
                 recovered = None
         if recovered is None:
@@ -1735,14 +1814,6 @@ def matching_ticket(group: PackageGroup, rights_id: str) -> TicketInfo | None:
     return matches[0] if matches else None
 
 
-def eligible_title_rights_restore(artifact: NcaArtifact, cnmt_type: int) -> bool:
-    header = artifact.header
-    return (not header.has_title_rights and not header.is_gamecard
-            and header.distribution_type == 0
-            and cnmt_type in TITLE_BEARING_CNMT_TYPES
-            and header.content_type in TITLE_BEARING_NCA_TYPES)
-
-
 def is_gamecard_oriented(header: NcaHeader) -> bool:
     return header.is_gamecard or header.distribution_type != 0
 
@@ -1806,7 +1877,9 @@ def classify_missing_content(info: CnmtInfo, missing_entries: tuple[CnmtEntry, .
 
 
 def build_repair_plan(group: PackageGroup, group_work: Path, keys: KeySet,
-                      default_cert: Path, has_cnmt_db: bool) -> RepairPlan:
+                      default_cert: Path, has_cnmt_db: bool,
+                      knowledge: CnmtKnowledgeBase | None = None,
+                      firmware_catalog: tuple[int, ...] = ()) -> RepairPlan:
     info = group.meta.info
     plan = RepairPlan(
         group=group, outcome=Outcome.PRESERVE,
@@ -1835,7 +1908,6 @@ def build_repair_plan(group: PackageGroup, group_work: Path, keys: KeySet,
     outcomes: list[Outcome] = []
     rewrites: list[NcaRewrite] = []
     for artifact in standard_content:
-        entry = entry_by_id[artifact.nca_id]
         if artifact.verification.main_signature_valid:
             restored = artifact.recovery is not None
             decision = NcaDecision(
@@ -1845,45 +1917,32 @@ def build_repair_plan(group: PackageGroup, group_work: Path, keys: KeySet,
                 (f"{artifact.recovery_reason}; Nintendo main signature restored"
                  if restored else "Nintendo main signature valid"))
         else:
-            gamecard_rewrite = restore_gamecard_distribution_nca(
+            restoration = restore_signed_header_nca(
                 artifact.path, probe_dir, keys, artifact.sha256)
-            if gamecard_rewrite is not None:
-                verification = verify_nca_file(gamecard_rewrite.output, keys)
-                if verification.main_signature_valid:
-                    decision = NcaDecision(
-                        artifact, gamecard_rewrite.output, Outcome.RESTORED,
-                        verification, gamecard_rewrite,
-                        "gamecard distribution restoration regained Nintendo main signature")
-                else:
-                    plan.failures.append(
-                        "gamecard distribution restoration disagrees with final "
-                        f"signature verification: {artifact.path.name}")
-                    decision = NcaDecision(
-                        artifact, gamecard_rewrite.output, Outcome.IMPOSSIBLE,
-                        verification, gamecard_rewrite,
-                        "gamecard signature recovery failed final verification")
-            elif eligible_title_rights_restore(artifact, entry.content_type):
-                rewrite = restore_title_rights_nca(
-                    artifact.path, probe_dir, keys, artifact.sha256)
+            if restoration is not None:
+                rewrite, reason = restoration
                 verification = verify_nca_file(rewrite.output, keys)
                 if verification.main_signature_valid:
                     decision = NcaDecision(
                         artifact, rewrite.output, Outcome.RESTORED,
                         verification, rewrite,
-                        "title-rights reversal restored Nintendo main signature")
+                        f"{reason} regained Nintendo main signature")
                 else:
                     plan.failures.append(
-                        "NCA main signature still fails after title-rights reversal: "
-                        f"{artifact.path.name}")
+                        "restored header disagrees with final signature "
+                        f"verification: {artifact.path.name}")
                     decision = NcaDecision(
                         artifact, rewrite.output, Outcome.IMPOSSIBLE,
-                        verification, rewrite, "signature recovery failed")
+                        verification, rewrite,
+                        "signature recovery failed final verification")
             else:
-                plan.failures.append(f"NCA main signature fails: {artifact.path.name}")
+                plan.failures.append(
+                    "NCA main signature fails; no transform in the composed "
+                    f"enumeration restores it: {artifact.path.name}")
                 decision = NcaDecision(
                     artifact, artifact.path, Outcome.IMPOSSIBLE,
                     artifact.verification,
-                    reason="unsigned NCA has no unambiguous repair")
+                    reason="unsigned NCA beyond the enumerated transform space")
         plan.content.append(decision)
         outcomes.append(decision.outcome)
         if decision.rewrite is not None and artifact.recovery is None:
@@ -1920,24 +1979,28 @@ def build_repair_plan(group: PackageGroup, group_work: Path, keys: KeySet,
             (f"{group.meta_artifact.recovery_reason}; Meta NCA main signature restored"
              if restored else "Meta NCA main signature valid"))
     else:
-        gamecard_meta = restore_gamecard_distribution_nca(
-            group.meta.header.path, probe_dir, keys, group.meta_artifact.sha256)
-        if gamecard_meta is not None:
-            meta_verification = verify_nca_file(gamecard_meta.output, keys)
+        meta_restoration = restore_signed_header_nca(
+            group.meta.header.path, probe_dir, keys, group.meta_artifact.sha256,
+            knowledge, firmware_catalog,
+            {artifact.nca_id: artifact for artifact in group.content})
+        if meta_restoration is not None:
+            meta_rewrite, reason = meta_restoration
+            meta_verification = verify_nca_file(meta_rewrite.output, keys)
             if meta_verification.main_signature_valid:
                 plan.meta = NcaDecision(
-                    group.meta_artifact, gamecard_meta.output, Outcome.RESTORED,
-                    meta_verification, gamecard_meta,
-                    "gamecard distribution restoration regained Meta NCA signature")
+                    group.meta_artifact, meta_rewrite.output, Outcome.RESTORED,
+                    meta_verification, meta_rewrite,
+                    f"{reason} regained Meta NCA signature")
             else:
-                reason = "gamecard Meta signature recovery failed final verification"
+                reason = "restored Meta header failed final signature verification"
                 plan.failures.append(reason)
                 plan.meta = NcaDecision(
-                    group.meta_artifact, gamecard_meta.output, Outcome.IMPOSSIBLE,
-                    meta_verification, gamecard_meta, reason)
+                    group.meta_artifact, meta_rewrite.output, Outcome.IMPOSSIBLE,
+                    meta_verification, meta_rewrite, reason)
         else:
             plan.failures.append(
-                f"Meta NCA main signature fails: {group.meta.header.path.name}")
+                "Meta NCA main signature fails; no transform in the composed "
+                f"enumeration restores it: {group.meta.header.path.name}")
             plan.meta = NcaDecision(
                 group.meta_artifact, group.meta.header.path, Outcome.IMPOSSIBLE,
                 group.meta_artifact.verification, reason="Meta NCA signature invalid")
@@ -2273,7 +2336,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 group_work = source_work / f"group-{index:03d}"
                 has_db = knowledge.record_exists(group.meta.info)
-                plan = build_repair_plan(group, group_work, keys, args.cert, has_db)
+                plan = build_repair_plan(group, group_work, keys, args.cert,
+                                         has_db, knowledge, firmware_catalog)
                 print_plan(plan)
                 if not plan.publishable:
                     failed += 1

@@ -27,6 +27,12 @@ approve bytes. Databases (CNMTDB, titledb) propose; signatures dispose.
 ## Step 1 — Intake
 
 Accept NSP, NSZ, XCI, XCZ. NSZ/XCZ decompress via `nsz -D` into staging.
+The Python bootstrap runs through local `nsz_codec.main`, which corrects
+NSZ 5.0's decompressed-member size calculation without changing the installed
+package or its decoder. A first NCZ section can overlap the preserved 16 KiB
+prefix or begin after it; the output extent is the final contiguous section
+end. Counting the prefix twice produces false PFS0 sizes and shifts subsequent
+file offsets. Invalid section geometry and container bounds still fail.
 FAT32-split NSP directories (contiguous numeric parts, consistent chunk size)
 are rejoined as part of intake — no separate utility. PFS0 and HFS0 tables
 are parsed by in-house bounds-checked readers; a trimmed XCI whose nominal
@@ -41,6 +47,10 @@ most one normalized NSP. A malformed group never blocks other groups in the
 same container. Unreadable, duplicate, and unreferenced files are reported
 and left unused. An identifiable Meta that cannot be read is a failed group,
 never downgraded to an unused-wrapper warning.
+
+Inspect content NCAs before attempting Meta recovery, independent of wrapper
+filename order. A Meta can require hashes from those signed content recoveries
+before its own signature can be restored.
 
 ## Step 3 — Meta parsing under declared geometry
 
@@ -95,6 +105,17 @@ The old linear ladder tested transforms in isolation and could not reach
 composed mutilations (de-rights'd AND downgraded AND flag-flipped); the
 enumeration reaches every point of the space.
 
+**Best effort, defined**: every signature-failing NCA goes through the full
+enumeration — no lane keeps a linear remnant. Two lanes differ only in
+oracle strength, never in coverage: a *noncanonical* NCA (hash disagrees
+with its CNMT-declared id) demands signature AND expected-id; a
+*hash-consistent* NCA (its bytes are its name, yet unsigned) has no
+expected id to hit, and the signature alone decides — sufficient, because
+at most one candidate can ever verify. An NCA leaves the fix either
+Nintendo-signature-valid or honestly IMPOSSIBLE; when content restorations
+change ids, the rebuilt Meta must regain Nintendo's signature, confirming
+the whole group reconstruction end-to-end.
+
 Direction law: the title-rights reversal runs forward only (key area →
 ticket). The inverse — stuffing a ticket key into the key area — is the
 homebrew mutilation itself, never canonical. Proven gamecard content never
@@ -125,13 +146,31 @@ Nintendo's signature or the group fails.
 `RequiredSystemVersion` / `RequiredApplicationVersion` (CNMT extended
 header — protected transitively by the Meta signature; tampering is detected
 for free): restoration is candidate enumeration under the same oracle —
-**CNMTDB records first; when the DB is silent, the released-firmware
-catalog** (a finite public list, a few hundred values) bounds the axis. Each
-candidate costs one small-Meta rebuild plus one RSA verify. DB and catalog
-both silent → honest failure. The firmware-catalog fallback exists precisely
-for the MIA lane, where CNMTDB is most likely silent. A valid signed local
+**same-title CNMTDB records first**, then the finite set of system-version
+values observed in other local CNMTDB records and the optional released-firmware
+catalog. Observed values are deduplicated, restricted to uint32 integers and
+capped at 1,000 distinct proposals. A missing same-title record or optional
+firmware file does not discard the evidence available in the remaining records.
+If a title-specific proposal fails, the bounded fallback still runs. Each
+candidate costs one small-Meta rebuild plus one RSA verify. No candidate source
+→ honest failure when a scalar repair is needed. A valid signed local
 Meta/CNMT always remains the authoritative metadata source; DB values never
 change acceptance or naming on their own.
+
+Some downgrades keep original CNMT content IDs but overwrite the full hashes
+with hashes of the modified NCAs. A full hash can be restored when the referenced
+NCA has already regained its Nintendo signature and exact original ID, the
+CNMT hash equals that recovery's recorded input hash, and the declared size
+matches. This hash repair composes with header and scalar restoration in both
+Meta recovery lanes. Other CNMT bytes, including its trailing digest, stay as
+supplied. The resulting Meta must regain its own signature; the noncanonical
+lane must also regain the expected filename ID. Failed proofs stay rejected.
+
+> Lesson (Monument Valley 3): restoring generation 18 alone was insufficient.
+> Three CNMT hashes described the damaged content and requiredSystemVersion was
+> zero. Composing the recovered content hashes with the locally observed
+> 20.0.1 value restored the Meta's signature and exact original ID
+> `e4ca1e440fce0adef4222ac64d4384dc`. Discovery must allow that proof to run.
 
 Footnote: the NCA header's `sdk_addon_version` (0x21C, signed, informational,
 no bootability effect) has no axis today; if a real tampered instance ever
@@ -244,6 +283,7 @@ terminal hash ceremony: ingest measures the product at enrollment.
 under full verification (every NCA gamecard-oriented, rightsless, validly
 signed — re-checked at publication). Ingest honors the minted marker plus
 its own CNMT identity cross-check and does not re-verify gamecard-ness;
+known rejected hashes still quarantine in normal ingest, even for this lane;
 the dropzone is invitation-only by standing doctrine.
 
 Ingest's hashdb gate is the archival authority — including **sole authority
@@ -251,7 +291,16 @@ over ticket bytes** for hashdb-matched content. Admission priority for one
 TitleID/version: `vanilla > [GAMECARD] > [custom tag]`. `[NoHASHDB]` /
 `[BadHASHDB]` are file-level provenance markers for MIA work; hashdb
 `[h]`/isHack and bad-ticket rows are rejection records, not admission
-records. Enrollment stores round-trip-verified NSZ (archival profile
+records. The loader checks explicit `isHack` / `isBadTicket` booleans,
+`[h]` / `[b]` markers (including numbered forms) in both game and ROM names,
+and ROM `hacked` / `baddump` status. A rejected match takes precedence over
+any clean claim for the same hash. `[BASE]` is not a rejection marker.
+
+`--force LABEL` is the operator's explicit hashdb override: clean, rejected,
+and absent hashes all use the chosen label. This lane does not require or load
+the DATs. CNMT identity, existing-release priority/conflict checks, copying and
+bookkeeping audits still apply. It preserves a bare labeled NSP, decompressing
+an NSZ input first. Normal enrollment stores round-trip-verified NSZ (archival profile
 `-K -l 22 -t 16`); the round-trip sha1 check is ingest's own-product audit,
 not a duplication of engine work.
 
