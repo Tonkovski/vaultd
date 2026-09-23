@@ -296,7 +296,14 @@ records. The loader checks explicit `isHack` / `isBadTicket` booleans,
 and ROM `hacked` / `baddump` status. A rejected match takes precedence over
 any clean claim for the same hash. `[BASE]` is not a rejection marker.
 
-`--force LABEL` is the operator's explicit hashdb override: clean, rejected,
+Normal hashdb admission also requires a clean matching ROM filename containing
+the input CNMT's exact `[TID]` token, case-insensitively. Other clean claimants
+are reported but cannot authorize admission. If none has the TID, the source
+stays in the dropzone as a conflict. Updates use their own TID, not the base
+entity ID. This adds no DAT version/type checks or additional hash checks.
+
+`--force LABEL` is the operator's explicit hashdb override, including the DAT
+filename TID check: clean, rejected,
 and absent hashes all use the chosen label. This lane does not require or load
 the DATs. CNMT identity, existing-release priority/conflict checks, copying and
 bookkeeping audits still apply. It preserves a bare labeled NSP, decompressing

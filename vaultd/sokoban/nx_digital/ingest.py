@@ -96,29 +96,41 @@ def entity_for(tid: str, type_name: str) -> str:
     return tid
 
 
-def load_hashdb(hashdb: Path) -> dict[str, dict[str, bool]]:
-    """sha1(lower) -> {game name: is_rejection_row}.
+def rejection_reasons(game: ET.Element, rom: ET.Element) -> tuple[str, ...]:
+    """Shared DAT classification for ingest and label rematching."""
+    reasons = [flag for flag in ("isHack", "isBadTicket")
+               if (game.findtext(flag) or "").strip().lower() in {"true", "1"}]
+    for field, name in (("game", game.get("name") or ""),
+                        ("rom", rom.get("name") or "")):
+        reasons.extend(f"{field} {match.group()}" for match in REJECT_ROW_RE.finditer(name))
+    status = (rom.get("status") or "").strip().lower()
+    if status in {"baddump", "hacked"}:
+        reasons.append(f"status={status}")
+    return tuple(reasons)
 
-    Keyed by name because the No-Intro dats overlap heavily (1G1U, Standard,
-    Games and Updates all list the same rows): identical names collapse, so
-    only genuinely distinct claimants surface as a clash."""
+
+def rom_matches_tid(rom_name: str, title_id: str) -> bool:
+    """Match the exact bracketed TID token used by the local DAT filenames."""
+    return f"[{title_id.upper()}]" in rom_name.upper()
+
+
+def load_hashdb(hashdb: Path) -> dict[str, dict[str, bool]]:
+    """sha1(lower) -> {ROM filename: is_rejection_row}.
+
+    Identical ROM filenames across overlapping DATs collapse. Keep the actual
+    filename so admission can check its bracketed title ID."""
     lookup: dict[str, dict[str, bool]] = {}
     dats = sorted(hashdb.glob("*.xml"))
     print(f"hashdb: {hashdb} ({len(dats)} dat(s))")
     for dat in dats:
         root = ET.parse(dat).getroot()
         for game in root.iter("game"):
-            name = game.get("name") or ""
-            reject = bool(REJECT_ROW_RE.search(name)) or any(
-                (game.findtext(flag) or "").strip().lower() in {"true", "1"}
-                for flag in ("isHack", "isBadTicket"))
             for rom in game.iter("rom"):
                 sha1 = rom.get("sha1")
                 if not sha1:
                     continue
-                status = (rom.get("status") or "").strip().lower()
-                row_reject = (reject or status in {"baddump", "hacked"}
-                              or bool(REJECT_ROW_RE.search(rom.get("name") or "")))
+                row_reject = bool(rejection_reasons(game, rom))
+                name = rom.get("name") or ""
                 rows = lookup.setdefault(sha1.lower(), {})
                 rows[name] = rows.get(name, False) or row_reject
     print(f"  {len(lookup)} rom hashes indexed")
@@ -127,7 +139,7 @@ def load_hashdb(hashdb: Path) -> dict[str, dict[str, bool]]:
 
 def admission_marker(subject_sha1: str, gate: dict[str, dict[str, bool]],
                      incoming_gamecard: bool, force_label: str | None,
-                     identity: str, warnings: list[str]) -> str:
+                     identity: str, warnings: list[str], *, title_id: str) -> str:
     """Explicit force overrides the database; ordinary ingest rejects any bad hit."""
     if force_label is not None:
         print(f"  gate:   --force [{force_label}], hashdb bypassed")
@@ -142,12 +154,23 @@ def admission_marker(subject_sha1: str, gate: dict[str, dict[str, bool]],
     clean = sorted(rows)
     if not clean:
         raise Skip("undecided", "hashdb miss; left in dropzone (fresher dat, or --force LABEL)")
-    if len(clean) > 1:
-        warn = (f"{identity} sha1 claimed by {len(clean)} distinct clean hashdb rows:\n"
-                + "\n".join(f"        - {name}" for name in clean))
+    matching = [name for name in clean if rom_matches_tid(name, title_id)]
+    if not matching:
+        raise Skip("conflict", f"SHA-1 matches hashdb, but no ROM filename contains "
+                   f"[{title_id.upper()}]; source retained:\n"
+                   + "\n".join(f"        - {name}" for name in clean))
+    ignored = [name for name in clean if name not in matching]
+    if ignored:
+        warn = (f"{identity} ignored clean SHA-1 claimant(s) without the matching TID:\n"
+                + "\n".join(f"        - {name}" for name in ignored))
         warnings.append(warn)
         print(f"  WARN: {warn}")
-    print(f"  hashdb: {clean[0]}")
+    if len(matching) > 1:
+        warn = (f"{identity} sha1 claimed by {len(matching)} clean hashdb rows with matching TID:\n"
+                + "\n".join(f"        - {name}" for name in matching))
+        warnings.append(warn)
+        print(f"  WARN: {warn}")
+    print(f"  hashdb: {matching[0]}")
     return ""
 
 
@@ -227,12 +250,12 @@ def nsz_roundtrip(nsp: Path, work: Path, source_sha1: str) -> Path:
         if directory.exists():
             shutil.rmtree(directory)
         directory.mkdir(parents=True)
-    print(f"  nsz:    compressing (archival profile {' '.join(NSZ_COMPRESS_ARGS)})")
+    print(f"  nsz:    compressing (archival profile {' '.join(NSZ_COMPRESS_ARGS)})", flush=True)
     run_nsz([*NSZ_COMPRESS_ARGS, "-o", str(compress_dir), str(nsp)])
     produced = sorted(compress_dir.glob("*.nsz"))
     if len(produced) != 1:
         raise Skip("failed", f"nsz produced {len(produced)} outputs")
-    print("  nsz:    round-trip verification")
+    print("  nsz:    round-trip verification", flush=True)
     run_nsz(["-D", "-o", str(verify_dir), str(produced[0])])
     back = sorted(verify_dir.glob("*.nsp"))
     if len(back) != 1:
@@ -352,7 +375,7 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
 
     # --- admission gate ---
     marker = admission_marker(subject_sha1, gate, incoming_gamecard, force_label,
-                              f"[{tid}][{ver}][{type_name}]", warnings)
+                              f"[{tid}][{ver}][{type_name}]", warnings, title_id=info.title_id)
 
     # --- decision matrix against the enrolled release ---
     entity_tid = entity_for(tid, type_name)
