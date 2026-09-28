@@ -2,11 +2,11 @@
 
 Intake scans ONLY the dropzone root — keeper sub-areas (fixnsp*/, duplicate/,
 quarantine/, ...) are invisible to it. Anomalies are admission rejections and
-are MOVED to their right position: hashdb rejection-row hits to
-dropzone/quarantine/, label-priority losers to dropzone/duplicate/. Mere
-byte-duplicates of enrolled artifacts are DELETED. A plain hashdb miss is
-not an anomaly: the file stays in the dropzone awaiting a fresher dat or an
-explicit --force LABEL.
+are MOVED to their right position: hashdb rejection-row hits, known TID/version
+hash mismatches and unverified NSP/NSZ overlaps to dropzone/quarantine/;
+label-priority losers to dropzone/duplicate/. Byte-duplicates of enrolled
+artifacts are DELETED. An unknown hash whose TID/version is also absent from
+hashdb stays in the dropzone awaiting a fresher dat or an explicit --force LABEL.
 
 Identity: every input's CNMT is read in-house (fixnsp machinery) and must
 agree with the filename on title id, version and type. Entity grouping:
@@ -23,12 +23,15 @@ Storage lanes:
                            rejected matches); bare NSP as [..][TYPE][LABEL].nsp
 Admission priority for one (entity, version): vanilla > [GAMECARD] > [custom
 label]; distinct customs coexist; the same marker with different bytes is a
-conflict (left in place, resolve by hand).
+conflict (left in place, resolve by hand). If that marker is already stored
+as NSZ, the incoming NSP form cannot be compared directly: quarantine the
+input for review without compressing it or unpacking the enrolled NSZ.
 """
 
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import re
 import shutil
 import subprocess
@@ -114,11 +117,28 @@ def rom_matches_tid(rom_name: str, title_id: str) -> bool:
     return f"[{title_id.upper()}]" in rom_name.upper()
 
 
-def load_hashdb(hashdb: Path) -> dict[str, dict[str, bool]]:
+@dataclass
+class HashDB:
+    by_sha1: dict[str, dict[str, bool]] = field(default_factory=dict)
+    by_identity: dict[tuple[str, int], set[str]] = field(init=False, default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Index every recorded hash, including rejection rows. Presence here
+        # establishes that the version is known, not that every hash is clean.
+        for sha1, rows in self.by_sha1.items():
+            for name in rows:
+                tids, versions = TID_RE.findall(name), VER_RE.findall(name)
+                if len(tids) == len(versions) == 1:
+                    identity = (tids[0].upper(), int(versions[0][1:]))
+                    self.by_identity.setdefault(identity, set()).add(sha1)
+
+
+def load_hashdb(hashdb: Path) -> HashDB:
     """sha1(lower) -> {ROM filename: is_rejection_row}.
 
     Identical ROM filenames across overlapping DATs collapse. Keep the actual
-    filename so admission can check its bracketed title ID."""
+    filename so admission can check its bracketed title ID and index the
+    recorded hashes by TID/version."""
     lookup: dict[str, dict[str, bool]] = {}
     dats = sorted(hashdb.glob("*.xml"))
     print(f"hashdb: {hashdb} ({len(dats)} dat(s))")
@@ -134,23 +154,30 @@ def load_hashdb(hashdb: Path) -> dict[str, dict[str, bool]]:
                 rows = lookup.setdefault(sha1.lower(), {})
                 rows[name] = rows.get(name, False) or row_reject
     print(f"  {len(lookup)} rom hashes indexed")
-    return lookup
+    return HashDB(lookup)
 
 
-def admission_marker(subject_sha1: str, gate: dict[str, dict[str, bool]],
+def admission_marker(subject_sha1: str, gate: HashDB,
                      incoming_gamecard: bool, force_label: str | None,
-                     identity: str, warnings: list[str], *, title_id: str) -> str:
+                     identity: str, warnings: list[str], *, title_id: str,
+                     version: int) -> str:
     """Explicit force overrides the database; ordinary ingest rejects any bad hit."""
     if force_label is not None:
         print(f"  gate:   --force [{force_label}], hashdb bypassed")
         return force_label
-    rows = gate.get(subject_sha1, {})
+    rows = gate.by_sha1.get(subject_sha1, {})
     rejected = sorted(name for name, reject in rows.items() if reject)
     if rejected:
         raise Skip("quarantined", "hashdb rejection row(s): " + "; ".join(rejected))
     if incoming_gamecard:
         print("  gate:   [GAMECARD] variant, positive hashdb match not required")
         return "GAMECARD"
+    known_hashes = gate.by_identity.get((title_id.upper(), version), set())
+    if known_hashes and subject_sha1 not in known_hashes:
+        raise Skip("quarantined",
+                   f"hashdb knows [{title_id.upper()}][v{version}], but NSP SHA-1 "
+                   f"{subject_sha1} matches none of its {len(known_hashes)} recorded hash(es); "
+                   "input retained in dropzone/quarantine")
     clean = sorted(rows)
     if not clean:
         raise Skip("undecided", "hashdb miss; left in dropzone (fresher dat, or --force LABEL)")
@@ -341,7 +368,7 @@ def self_audit(xml_path: Path) -> list[str]:
 
 def ingest_one(source: Path, work_root: Path, root: ET.Element,
                entries: dict[str, checksum.Entry], vdir: Path,
-               gate: dict[str, dict[str, bool]], titledb: TitleDB | None,
+               gate: HashDB, titledb: TitleDB | None,
                keys: KeySet, force_label: str | None,
                warnings: list[str]) -> str:
     parsed = parse_name(source)
@@ -375,7 +402,8 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
 
     # --- admission gate ---
     marker = admission_marker(subject_sha1, gate, incoming_gamecard, force_label,
-                              f"[{tid}][{ver}][{type_name}]", warnings, title_id=info.title_id)
+                              f"[{tid}][{ver}][{type_name}]", warnings,
+                              title_id=info.title_id, version=info.version)
 
     # --- decision matrix against the enrolled release ---
     entity_tid = entity_for(tid, type_name)
@@ -387,12 +415,18 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
     incoming_rank = marker_priority(marker)
     if release_el is not None:
         enrolled_markers: set[str] = set()
+        enrolled_nsz: list[str] = []
         for fe in release_files(release_el):
-            enrolled_marker = stored_marker(fe.get("path", ""))
+            enrolled_name = fe.get("path", "")
+            enrolled_marker = stored_marker(enrolled_name)
             if enrolled_marker is None:
                 continue
             enrolled_markers.add(enrolled_marker)
-            if (fe.get("sha1") or "").lower() == subject_sha1:
+            if (enrolled_marker == marker
+                    and Path(enrolled_name).suffix.lower() == ".nsz"):
+                enrolled_nsz.append(enrolled_name)
+            if (Path(enrolled_name).suffix.lower() == subject.suffix.lower()
+                    and (fe.get("sha1") or "").lower() == subject_sha1):
                 raise Skip("duplicate", "bytes already enrolled; source deleted")
         if any(marker_priority(existing) < incoming_rank
                for existing in enrolled_markers):
@@ -400,6 +434,12 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
                        "higher-priority artifact already enrolled for this "
                        f"release; [{marker or 'vanilla'}] candidate moved to "
                        "dropzone/duplicate")
+        if enrolled_nsz and subject.suffix.lower() == ".nsp":
+            raise Skip("quarantined",
+                       f"version {ver} already enrolled under '{marker or 'vanilla'}' "
+                       f"as NSZ: {', '.join(sorted(enrolled_nsz))}; "
+                       "NSP and NSZ hashes are not comparable; content equivalence "
+                       "unverified, compression skipped; input retained in dropzone/quarantine")
         if marker in enrolled_markers:
             raise Skip("conflict",
                        f"version {ver} already enrolled under "
@@ -507,7 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     keys = KeySet.load(args.keys)
-    gate = load_hashdb(hashdb_dir) if args.force is None else {}
+    gate = load_hashdb(hashdb_dir) if args.force is None else HashDB()
     titledb = TitleDB(DB_DIR / "titledb")
     if titledb.available():
         print(f"titledb: {DB_DIR / 'titledb'}")
@@ -554,10 +594,12 @@ def main(argv: list[str] | None = None) -> int:
                                          else "quarantine")
                 target_dir.mkdir(parents=True, exist_ok=True)
                 target = target_dir / source.name
-                if target.exists():
-                    target.unlink()
+                number = 1
+                while target.exists() or target.is_symlink():
+                    target = target_dir / f"{source.stem}.{number}{source.suffix}"
+                    number += 1
                 shutil.move(str(source), str(target))
-                print(f"  moved to {target_dir}")
+                print(f"  moved to {target}")
             continue
         catwrite.bump_stamp(root)
         catwrite.sort_tree(root)

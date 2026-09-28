@@ -300,10 +300,32 @@ Normal hashdb admission also requires a clean matching ROM filename containing
 the input CNMT's exact `[TID]` token, case-insensitively. Other clean claimants
 are reported but cannot authorize admission. If none has the TID, the source
 stays in the dropzone as a conflict. Updates use their own TID, not the base
-entity ID. This adds no DAT version/type checks or additional hash checks.
+entity ID.
+
+The DAT ROM filenames also index recorded NSP hashes by `[TID][vN]`. In normal
+digital ingest, if the CNMT's TID/version is known but the incoming NSP SHA-1
+matches none of those hashes, the input moves to `dropzone/quarantine/` before
+compression or enrollment. An NSZ input is checked using its decompressed NSP.
+This applies even when the release has never been ingested, and when that hash
+appears elsewhere in the DATs. Multiple hashes for the same identity are allowed;
+an exact rejection-row match still takes precedence. Records marked rejected
+also establish that a TID/version is present. Only an unknown hash with an absent
+TID/version remains `UNDECIDED` in the dropzone. These checks reuse the measured
+NSP hash; no extra hashing or DAT type requirement is added. The verified
+`[GAMECARD]` lane keeps its existing no-positive-match rule because card bytes
+can differ from the digital release; exact rejected hashes still quarantine.
+
+When the same release and marker already have an enrolled NSZ, ingest cannot
+compare that stored hash directly with the incoming NSP hash (including the
+decompressed form of an incoming NSZ). It moves the input to
+`dropzone/quarantine/` as an unverified overlap, without compressing it or
+decompressing the enrolled copy. This does not assert a duplicate or different
+game content. The enrolled artifact and bookkeeping stay unchanged. Quarantine
+and label-duplicate moves retain existing same-named files by choosing a numbered
+filename for the incoming file.
 
 `--force LABEL` is the operator's explicit hashdb override, including the DAT
-filename TID check: clean, rejected,
+filename TID check and known-version hash mismatch: clean, rejected,
 and absent hashes all use the chosen label. This lane does not require or load
 the DATs. CNMT identity, existing-release priority/conflict checks, copying and
 bookkeeping audits still apply. It preserves a bare labeled NSP, decompressing
