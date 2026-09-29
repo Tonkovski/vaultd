@@ -1,12 +1,12 @@
 """NX digital keeper: ingest NSP/NSZ artifacts from the workspace dropzone.
 
 Intake scans ONLY the dropzone root — keeper sub-areas (fixnsp*/, duplicate/,
-quarantine/, ...) are invisible to it. Anomalies are admission rejections and
-are MOVED to their right position: hashdb rejection-row hits, known TID/version
-hash mismatches and unverified NSP/NSZ overlaps to dropzone/quarantine/;
-label-priority losers to dropzone/duplicate/. Byte-duplicates of enrolled
-artifacts are DELETED. An unknown hash whose TID/version is also absent from
-hashdb stays in the dropzone awaiting a fresher dat or an explicit --force LABEL.
+quarantine/, ...) are invisible to it. Clean DAT TID/version hash mismatches
+move to dropzone/quarantine/; label-priority losers to dropzone/duplicate/.
+Conflicts, including unverified NSP/NSZ overlaps, stay in the dropzone for
+manual resolution. Byte-duplicates of enrolled artifacts are DELETED. An unknown hash whose TID/version is also absent from
+the clean hashdb stays in the dropzone awaiting a fresher dat or --force LABEL.
+Bad-ticket, hacked and bad-dump DAT rows are absent from both lookup indexes.
 
 Identity: every input's CNMT is read in-house (fixnsp machinery) and must
 agree with the filename on title id, version and type. Entity grouping:
@@ -17,20 +17,20 @@ Storage lanes:
   * hashdb clean match  -> archival NSZ (nsz -C -K -l 22 -t 16), decompressed
                            and sha1-verified against the source before
                            enrollment; stored [tid][vN][TYPE].nsz
-  * [GAMECARD] variant  -> no positive hashdb match required; known rejected
-                           hashes still quarantine; same NSZ round-trip
-  * --force LABEL       -> bypass every hashdb verdict (including clean and
-                           rejected matches); bare NSP as [..][TYPE][LABEL].nsp
+  * [GAMECARD] variant  -> no positive hashdb match required; same NSZ round-trip
+  * --force LABEL       -> bypass hashdb; bare NSP as [..][TYPE][LABEL].nsp
 Admission priority for one (entity, version): vanilla > [GAMECARD] > [custom
 label]; distinct customs coexist; the same marker with different bytes is a
 conflict (left in place, resolve by hand). If that marker is already stored
-as NSZ, the incoming NSP form cannot be compared directly: quarantine the
-input for review without compressing it or unpacking the enrolled NSZ.
+as NSZ, the incoming NSP form cannot be compared directly: report a conflict
+and retain the input without compressing it or unpacking the enrolled NSZ.
+Incoming NSZ bytes can be compared directly with the recorded NSZ hash.
 """
 
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 from dataclasses import dataclass, field
 import re
 import shutil
@@ -44,7 +44,8 @@ from vaultd.catwrite import t
 from vaultd.locator import DB_ROOT, DROPZONE, REPO_ROOT
 from vaultd.sokoban.nx_digital import VAULT_NAME
 from vaultd.sokoban.nx_digital.fixnsp import (
-    FixError, KeySet, read_meta_payload, read_pfs0_table)
+    FixError, KeySet, copy_exact, read_meta_payload, read_pfs0_table)
+from vaultd.sokoban.nx_digital import ingest_state as state
 from vaultd.titledb import TitleDB
 
 SCHEMA = REPO_ROOT / "convention" / "datmeta.xsd"
@@ -52,7 +53,7 @@ DB_DIR = DB_ROOT / VAULT_NAME
 NSZ_COMPRESS_ARGS = ("-C", "-K", "-l", "22", "-t", "16")
 
 TID_RE = re.compile(r"\[([0-9A-Fa-f]{16})\]")
-VER_RE = re.compile(r"\[(v\d+)\]")
+VER_RE = re.compile(r"\[(v[0-9]+)\]", re.IGNORECASE)
 TYPE_RE = re.compile(r"\[(BASE|UPD|DLC)\]", re.IGNORECASE)
 MARKER_RE = re.compile(r"\[([A-Za-z0-9][A-Za-z0-9_-]*)\]")
 LABEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -72,9 +73,9 @@ def parse_name(path: Path) -> tuple[str, str, str, list[str]] | None:
     tids = TID_RE.findall(stem)
     vers = VER_RE.findall(stem)
     types = TYPE_RE.findall(stem)
-    if not tids or not vers or not types:
+    if not (len(tids) == len(vers) == len(types) == 1):
         return None
-    tid, ver, type_name = tids[0].upper(), vers[0], types[0].upper()
+    tid, ver, type_name = tids[0].upper(), vers[0].lower(), types[0].upper()
     markers: list[str] = []
     for token in MARKER_RE.findall(stem):
         upper = token.upper()
@@ -82,6 +83,8 @@ def parse_name(path: Path) -> tuple[str, str, str, list[str]] | None:
                 or upper in {"BASE", "UPD", "DLC"}:
             continue
         markers.append("GAMECARD" if upper == "GAMECARD" else token)
+    if len(markers) > 1:
+        return None
     return tid, ver, type_name, markers
 
 
@@ -119,14 +122,14 @@ def rom_matches_tid(rom_name: str, title_id: str) -> bool:
 
 @dataclass
 class HashDB:
-    by_sha1: dict[str, dict[str, bool]] = field(default_factory=dict)
+    # Only eligible rows enter either index. Rejected rows are not evidence of
+    # either a known hash or a known TID/version, and cannot poison clean copies.
+    by_sha1: dict[str, set[str]] = field(default_factory=dict)
     by_identity: dict[tuple[str, int], set[str]] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
-        # Index every recorded hash, including rejection rows. Presence here
-        # establishes that the version is known, not that every hash is clean.
-        for sha1, rows in self.by_sha1.items():
-            for name in rows:
+        for sha1, names in self.by_sha1.items():
+            for name in names:
                 tids, versions = TID_RE.findall(name), VER_RE.findall(name)
                 if len(tids) == len(versions) == 1:
                     identity = (tids[0].upper(), int(versions[0][1:]))
@@ -134,26 +137,27 @@ class HashDB:
 
 
 def load_hashdb(hashdb: Path) -> HashDB:
-    """sha1(lower) -> {ROM filename: is_rejection_row}.
-
-    Identical ROM filenames across overlapping DATs collapse. Keep the actual
-    filename so admission can check its bracketed title ID and index the
-    recorded hashes by TID/version."""
-    lookup: dict[str, dict[str, bool]] = {}
+    """Index clean NSP hashes and their ROM names; ignore rejected DAT rows."""
+    lookup: dict[str, set[str]] = {}
     dats = sorted(hashdb.glob("*.xml"))
-    print(f"hashdb: {hashdb} ({len(dats)} dat(s))")
+    print(f"hashdb: {hashdb} ({len(dats)} dat(s))", flush=True)
+    ignored = 0
     for dat in dats:
-        root = ET.parse(dat).getroot()
-        for game in root.iter("game"):
+        for _, game in ET.iterparse(dat, events=("end",)):
+            if game.tag != "game":
+                continue
             for rom in game.iter("rom"):
-                sha1 = rom.get("sha1")
+                if rejection_reasons(game, rom):
+                    ignored += 1
+                    continue
+                sha1 = (rom.get("sha1") or "").strip().lower()
                 if not sha1:
                     continue
-                row_reject = bool(rejection_reasons(game, rom))
-                name = rom.get("name") or ""
-                rows = lookup.setdefault(sha1.lower(), {})
-                rows[name] = rows.get(name, False) or row_reject
-    print(f"  {len(lookup)} rom hashes indexed")
+                if not re.fullmatch(r"[0-9a-f]{40}", sha1):
+                    raise ValueError(f"{dat.name}: invalid ROM SHA-1 for {rom.get('name')!r}")
+                lookup.setdefault(sha1, set()).add(rom.get("name") or "")
+            game.clear()
+    print(f"  {len(lookup)} clean rom hashes indexed; {ignored} rejected rows ignored", flush=True)
     return HashDB(lookup)
 
 
@@ -161,14 +165,11 @@ def admission_marker(subject_sha1: str, gate: HashDB,
                      incoming_gamecard: bool, force_label: str | None,
                      identity: str, warnings: list[str], *, title_id: str,
                      version: int) -> str:
-    """Explicit force overrides the database; ordinary ingest rejects any bad hit."""
+    """Only clean DAT evidence counts; explicit force bypasses this gate."""
     if force_label is not None:
         print(f"  gate:   --force [{force_label}], hashdb bypassed")
         return force_label
-    rows = gate.by_sha1.get(subject_sha1, {})
-    rejected = sorted(name for name, reject in rows.items() if reject)
-    if rejected:
-        raise Skip("quarantined", "hashdb rejection row(s): " + "; ".join(rejected))
+    rows = gate.by_sha1.get(subject_sha1, set())
     if incoming_gamecard:
         print("  gate:   [GAMECARD] variant, positive hashdb match not required")
         return "GAMECARD"
@@ -176,7 +177,7 @@ def admission_marker(subject_sha1: str, gate: HashDB,
     if known_hashes and subject_sha1 not in known_hashes:
         raise Skip("quarantined",
                    f"hashdb knows [{title_id.upper()}][v{version}], but NSP SHA-1 "
-                   f"{subject_sha1} matches none of its {len(known_hashes)} recorded hash(es); "
+                   f"{subject_sha1} matches none of its {len(known_hashes)} clean recorded hash(es); "
                    "input retained in dropzone/quarantine")
     clean = sorted(rows)
     if not clean:
@@ -221,7 +222,7 @@ def extract_cnmt_info(container: Path, work: Path, keys: KeySet):
     staged = work / metas[0].name
     with container.open("rb") as source, staged.open("wb") as output:
         source.seek(metas[0].offset)
-        output.write(source.read(metas[0].size))
+        copy_exact(source, output, metas[0].size)
     try:
         return read_meta_payload(staged, keys).info
     except FixError as exc:
@@ -253,6 +254,7 @@ def run_nsz(args: list[str]) -> None:
     def attempt() -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, "-c", _NSZ_BOOTSTRAP, "--machine-readable", *args],
+            cwd=REPO_ROOT,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE, text=True,
@@ -274,8 +276,7 @@ def nsz_roundtrip(nsp: Path, work: Path, source_sha1: str) -> Path:
     compress_dir = work / "nsz"
     verify_dir = work / "verify"
     for directory in (compress_dir, verify_dir):
-        if directory.exists():
-            shutil.rmtree(directory)
+        state.clear_work(directory, work)
         directory.mkdir(parents=True)
     print(f"  nsz:    compressing (archival profile {' '.join(NSZ_COMPRESS_ARGS)})", flush=True)
     run_nsz([*NSZ_COMPRESS_ARGS, "-o", str(compress_dir), str(nsp)])
@@ -292,7 +293,7 @@ def nsz_roundtrip(nsp: Path, work: Path, source_sha1: str) -> Path:
         raise Skip("failed",
                    "NSZ round-trip does not reproduce the source NSP "
                    f"({back_sha1[:12]}... != {source_sha1[:12]}...)")
-    shutil.rmtree(verify_dir)
+    state.clear_work(verify_dir, work)
     return produced[0]
 
 
@@ -328,28 +329,42 @@ def gate_path(rel_path: str, entries: dict[str, checksum.Entry]) -> None:
             raise Skip("failed", f"gate: case-twin of recorded path {existing}")
 
 
-def sweep_unrecorded(vdir: Path, rel_prefix: str,
-                     entries: dict[str, checksum.Entry]) -> None:
-    release_dir = vdir / "entities" / Path(*rel_prefix.split("/"))
-    if not release_dir.is_dir():
-        return
-    for path in sorted(release_dir.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = f"{rel_prefix}/{path.relative_to(release_dir).as_posix()}"
-        if rel not in entries:
-            print(f"  note:   removing unrecorded leftover {rel}")
-            path.unlink()
-    for path in sorted(release_dir.rglob("*"), reverse=True):
-        if path.is_dir() and not any(path.iterdir()):
-            path.rmdir()
+def check_enrolled(vdir: Path, rel_path: str, fe: ET.Element,
+                   entries: dict[str, checksum.Entry]) -> None:
+    """Never discard an input on the strength of a missing/stale declaration."""
+    entry = entries.get(rel_path)
+    if entry is None or any(str(getattr(entry, key)) != fe.get(key)
+                            for key in ("size", "crc", "md5", "sha1")):
+        raise Skip("failed", f"enrolled XML/checksum disagree: {rel_path}")
+    dest = state.contained(vdir / "entities", rel_path)
+    if not dest.is_file() or dest.stat().st_size != entry.size:
+        raise Skip("failed", f"enrolled file missing or wrong size: {rel_path}")
+
+
+def destination(vdir: Path, rel_path: str) -> Path:
+    """Check the actual destination, including unrecorded case twins/links."""
+    base = vdir / "entities"
+    dest = state.contained(base, rel_path)
+    current = base
+    for part in Path(rel_path).parts:
+        if current.is_dir():
+            for child in current.iterdir():
+                if child.name.casefold() == part.casefold() and child.name != part:
+                    raise Skip("failed", f"gate: case-twin of physical path {child}")
+        current = current / part
+        if current.is_symlink() or current.is_junction():
+            raise Skip("failed", f"gate: linked destination component {current}")
+    return dest
 
 
 def apply_metadata(entity_el: ET.Element, titledb: TitleDB | None) -> None:
     if titledb is None:
         return
     tid = entity_el.get("identifier", "")
-    description, publisher, region = titledb.query(tid)
+    try:
+        description, publisher, region = titledb.query(tid)
+    except (AttributeError, TypeError) as exc:
+        raise ValueError(f"malformed titledb metadata for {tid}: {exc}") from exc
     if description:
         print(f"  titledb: [{region}] {description}")
     if description and not entity_el.get("description"):
@@ -360,9 +375,12 @@ def apply_metadata(entity_el: ET.Element, titledb: TitleDB | None) -> None:
 
 def self_audit(xml_path: Path) -> list[str]:
     from lxml import etree
-    schema = etree.XMLSchema(etree.parse(str(SCHEMA)))
-    if schema.validate(etree.parse(str(xml_path))):
-        return []
+    try:
+        schema = etree.XMLSchema(etree.parse(str(SCHEMA)))
+        if schema.validate(etree.parse(str(xml_path))):
+            return []
+    except etree.LxmlError as exc:
+        return [str(exc)]
     return [f"line {entry.line}: {entry.message}" for entry in schema.error_log]
 
 
@@ -373,20 +391,21 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
                warnings: list[str]) -> str:
     parsed = parse_name(source)
     if parsed is None:
-        raise Skip("failed", "filename lacks [tid][vN][TYPE] identity")
+        raise Skip("failed", "filename needs one unambiguous [tid][vN][TYPE] "
+                   "identity and at most one marker")
     tid, ver, type_name, markers = parsed
     incoming_gamecard = "GAMECARD" in markers
     print(f"  id:     [{tid}][{ver}][{type_name}]"
           + (f" markers={markers}" if markers else ""))
 
     work = work_root / source.name
-    if work.exists():
-        shutil.rmtree(work)
+    state.clear_work(work, work_root)
     work.mkdir(parents=True)
 
     # --- identity cross-check (every input) ---
     subject = source
     if source.suffix.lower() == ".nsz":
+        print("  nsz:    decompressing input for CNMT and hashdb lookup", flush=True)
         decompress_dir = work / "decompressed"
         decompress_dir.mkdir()
         run_nsz(["-D", "-o", str(decompress_dir), str(source)])
@@ -397,7 +416,8 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
     info = extract_cnmt_info(subject, work / "cnmt", keys)
     cross_check(tid, ver, type_name, info)
 
-    subject_digest = hashing.digest(subject, crc=True, md5=True, sha1=True)
+    print("  hash:   measuring NSP for admission", flush=True)
+    subject_digest = hashing.digest(subject, sha1=True)
     subject_sha1 = str(subject_digest["sha1"]).lower()
 
     # --- admission gate ---
@@ -413,6 +433,8 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
     entity_el = find_entity(entities_el, entity_tid)
     release_el = find_release(entity_el, ver) if entity_el is not None else None
     incoming_rank = marker_priority(marker)
+    rel_prefix = f"{entity_tid}/releases/{ver}"
+    source_nsz_digest = None
     if release_el is not None:
         enrolled_markers: set[str] = set()
         enrolled_nsz: list[str] = []
@@ -420,72 +442,86 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
             enrolled_name = fe.get("path", "")
             enrolled_marker = stored_marker(enrolled_name)
             if enrolled_marker is None:
-                continue
+                raise Skip("failed", f"unrecognized enrolled artifact name: {enrolled_name}")
+            enrolled_identity = parse_name(Path(enrolled_name))
+            if enrolled_identity is None or enrolled_identity[:3] != (tid, ver, type_name):
+                raise Skip("conflict", f"release contains a different title identity: {enrolled_name}")
+            check_enrolled(vdir, f"{rel_prefix}/fs/shared/{enrolled_name}", fe, entries)
             enrolled_markers.add(enrolled_marker)
             if (enrolled_marker == marker
                     and Path(enrolled_name).suffix.lower() == ".nsz"):
                 enrolled_nsz.append(enrolled_name)
             if (Path(enrolled_name).suffix.lower() == subject.suffix.lower()
                     and (fe.get("sha1") or "").lower() == subject_sha1):
-                raise Skip("duplicate", "bytes already enrolled; source deleted")
+                raise Skip("duplicate", "NSP bytes already enrolled")
+            if (source.suffix.lower() == ".nsz"
+                    and Path(enrolled_name).suffix.lower() == ".nsz"):
+                if source_nsz_digest is None:
+                    print("  hash:   comparing input NSZ with enrolled NSZ", flush=True)
+                    source_nsz_digest = hashing.digest(source, sha1=True)
+                if (fe.get("sha1") or "").lower() == source_nsz_digest["sha1"]:
+                    raise Skip("duplicate", "NSZ bytes already enrolled")
         if any(marker_priority(existing) < incoming_rank
                for existing in enrolled_markers):
             raise Skip("labeldup",
                        "higher-priority artifact already enrolled for this "
                        f"release; [{marker or 'vanilla'}] candidate moved to "
                        "dropzone/duplicate")
-        if enrolled_nsz and subject.suffix.lower() == ".nsp":
-            raise Skip("quarantined",
+        if enrolled_nsz and source.suffix.lower() == ".nsp":
+            raise Skip("conflict",
                        f"version {ver} already enrolled under '{marker or 'vanilla'}' "
                        f"as NSZ: {', '.join(sorted(enrolled_nsz))}; "
                        "NSP and NSZ hashes are not comparable; content equivalence "
-                       "unverified, compression skipped; input retained in dropzone/quarantine")
+                       "unverified, compression skipped; source retained for manual resolution")
         if marker in enrolled_markers:
             raise Skip("conflict",
                        f"version {ver} already enrolled under "
-                       f"'{marker or 'vanilla'}' with different content: "
-                       "distinct variant, resolve by hand")
+                       f"'{marker or 'vanilla'}' with different stored bytes; "
+                       "source retained for manual resolution")
 
-    # --- storage lane ---
+    # --- storage lane and destination gate (before compression) ---
     if marker in {"", "GAMECARD"}:
-        if subject is source and source.suffix.lower() == ".nsz":
-            artifact = source
-        elif source.suffix.lower() == ".nsz":
-            artifact = source  # original NSZ verified via its own decompression
-        else:
-            artifact = nsz_roundtrip(subject, work, subject_sha1)
         suffix_marker = "[GAMECARD]" if marker == "GAMECARD" else ""
         stored_name = f"[{tid}][{ver}][{type_name}]{suffix_marker}.nsz"
     else:
-        artifact = subject
         stored_name = f"[{tid}][{ver}][{type_name}][{marker}].nsp"
 
-    rel_prefix = f"{entity_tid}/releases/{ver}"
     rel_path = f"{rel_prefix}/fs/shared/{stored_name}"
     gate_path(rel_path, entries)
-    sweep_unrecorded(vdir, rel_prefix, entries)
-    dest = vdir / "entities" / Path(*rel_path.split("/"))
+    if rel_path in entries:
+        raise Skip("failed", f"target already recorded outside the selected release: {rel_path}")
+    dest = destination(vdir, rel_path)
+
+    # Complete metadata lookup before touching the payload. The caller supplies
+    # a private catalog copy, discarded on failure.
+    if entity_el is None:
+        entity_el = ET.SubElement(entities_el, t("entity"), identifier=entity_tid)
+    apply_metadata(entity_el, titledb)
+
+    if marker in {"", "GAMECARD"}:
+        artifact = (source if source.suffix.lower() == ".nsz"
+                    else nsz_roundtrip(subject, work, subject_sha1))
+    else:
+        artifact = subject
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(artifact, dest)
-    placed = hashing.digest(dest, crc=True, md5=True, sha1=True)
-    expected_sha1 = (str(hashing.digest(artifact, sha1=True)["sha1"])
-                     if artifact != subject else subject_sha1)
-    if str(placed["sha1"]) != expected_sha1:
-        dest.unlink()
+    temporary = dest.with_name(dest.name + ".ingest.tmp")
+    if temporary.is_symlink() or temporary.is_junction():
+        raise Skip("failed", f"linked staging path: {temporary}")
+    print("  copy:   placing and checking artifact", flush=True)
+    with artifact.open("rb") as incoming, temporary.open("wb") as output:
+        placed = hashing.digest_stream(incoming, output=output, crc=True, md5=True, sha1=True)
+    if artifact == subject and placed["sha1"] != subject_sha1:
+        raise Skip("failed", "NSP changed after admission")
+    if artifact == source and source_nsz_digest is not None \
+            and placed["sha1"] != source_nsz_digest["sha1"]:
+        raise Skip("failed", "NSZ changed after comparison")
+    if hashing.digest(temporary, crc=True, md5=True, sha1=True) != placed:
         raise Skip("failed", "placed bytes differ from verified artifact")
-    if release_el is not None and any(
-            (fe.get("sha1") or "").lower() == str(placed["sha1"]).lower()
-            for fe in release_files(release_el)):
-        dest.unlink()
-        raise Skip("duplicate",
-                   "archival form already enrolled (deterministic NSZ); "
-                   "source deleted")
+    # Replace only this input's exact unrecorded destination (interrupted copy).
+    # Never sweep other undeclared files from the release directory.
+    temporary.replace(dest)
 
     # --- enroll phase ---
-    if entity_el is None:
-        entity_el = ET.SubElement(entities_el, t("entity"))
-        entity_el.set("identifier", entity_tid)
-    apply_metadata(entity_el, titledb)
     new_release = release_el is None
     if new_release:
         releases_el = entity_el.find(t("releases"))
@@ -493,10 +529,12 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
             releases_el = ET.SubElement(entity_el, t("releases"))
         release_el = ET.SubElement(releases_el, t("release"))
         release_el.set("version", ver)
-        if type_name == "UPD":
-            release_el.set("standalone", "false")
         ET.SubElement(release_el, t("fs"))
+    if type_name == "UPD":
+        release_el.set("standalone", "false")
     fs_el = release_el.find(t("fs"))
+    if fs_el is None:
+        fs_el = ET.SubElement(release_el, t("fs"))
     fe = ET.SubElement(fs_el, t("fileshared"))
     fe.set("path", stored_name)
     fe.set("size", str(placed["size"]))
@@ -507,8 +545,36 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
         crc=str(placed["crc"]), md5=str(placed["md5"]),
         sha1=str(placed["sha1"]), size=int(placed["size"]), path=rel_path)  # type: ignore[arg-type]
 
-    shutil.rmtree(work, ignore_errors=True)
     return "coexist" if not new_release else "enrolled"
+
+
+def valid_force_label(label: str) -> bool:
+    # These tokens would be mistaken for identity or a verified GAMECARD lane
+    # on the next run, losing the meaning of the manual label.
+    return (LABEL_TOKEN_RE.fullmatch(label) is not None
+            and label.upper() not in {"GAMECARD", "BASE", "UPD", "DLC"}
+            and re.fullmatch(r"[0-9A-Fa-f]{16}|[vV][0-9]+", label) is None)
+
+
+def route_skip(source: Path, skip: Skip, *, keep_source: bool) -> None:
+    if skip.verdict == "duplicate":
+        if not keep_source:
+            source.unlink()
+        print("  source retained (--copy)" if keep_source else "  duplicate source removed")
+        return
+    areas = {"labeldup": "duplicate", "quarantined": "quarantine"}
+    if skip.verdict not in areas:
+        return
+    target_dir = DROPZONE / areas[skip.verdict]
+    state.contained(DROPZONE, areas[skip.verdict])
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / source.name
+    number = 1
+    while target.exists() or target.is_symlink():
+        target = target_dir / f"{source.stem}.{number}{source.suffix}"
+        number += 1
+    shutil.move(str(source), str(target))
+    print(f"  moved to {target}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -523,108 +589,124 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--locator", type=Path, default=None,
                         help="alternate vaultd.local.toml")
     args = parser.parse_args(argv)
-
-    if args.force is not None and not LABEL_TOKEN_RE.match(args.force):
-        print(f"ERROR: invalid --force label {args.force!r}", file=sys.stderr)
-        return 2
-    if not args.keys.exists():
-        print(f"ERROR: prod.keys not found: {args.keys} "
-              "(needed for the CNMT identity cross-check)", file=sys.stderr)
-        return 2
-    try:
-        vdir = locator.resolve([VAULT_NAME], args.locator)[VAULT_NAME]
-    except locator.LocatorError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
-    xml_path = vdir / "datmeta.xml"
-    if not xml_path.is_file():
-        print(f"ERROR: missing {xml_path}", file=sys.stderr)
-        return 2
-    hashdb_dir = DB_DIR / "hashdb"
-    if args.force is None and not any(hashdb_dir.glob("*.xml")):
-        print(f"ERROR: no hashdb dats under {hashdb_dir}; run dbsync / add dats",
-              file=sys.stderr)
-        return 2
-
-    keys = KeySet.load(args.keys)
-    gate = load_hashdb(hashdb_dir) if args.force is None else HashDB()
-    titledb = TitleDB(DB_DIR / "titledb")
-    if titledb.available():
-        print(f"titledb: {DB_DIR / 'titledb'}")
-    else:
-        print("WARN: titledb region files not found; descriptions will be omitted")
-        titledb = None
-
-    # root-only scan: sub-directories of the dropzone are keeper territory.
-    inputs = sorted(path for path in DROPZONE.iterdir()
-                    if path.is_file() and path.suffix.lower() in {".nsp", ".nsz"})
-    print(f"vault:      {vdir}")
-    print(f"candidates: {len(inputs)}")
-    if not inputs:
-        return 0
-
-    tree = ET.parse(xml_path)
-    root = tree.getroot()
-    ck_path = vdir / "entities.checksum"
-    entries, problems = checksum.parse_file(ck_path)
-    for problem in problems:
-        print(f"ERROR: {problem}", file=sys.stderr)
-    if problems:
+    if args.force is not None and not valid_force_label(args.force):
+        print(f"ERROR: invalid or reserved --force label {args.force!r}", file=sys.stderr)
         return 2
 
     work_root = DROPZONE / "ingest-work"
-    counts = {"enrolled": 0, "coexist": 0, "duplicate": 0, "labeldup": 0,
-              "conflict": 0, "quarantined": 0, "undecided": 0, "failed": 0}
-    warnings: list[str] = []
-    for index, source in enumerate(inputs, 1):
-        print(f"\n[{index}/{len(inputs)}] {source.name}")
-        try:
-            lane = ingest_one(source, work_root, root, entries, vdir, gate,
-                              titledb, keys, args.force, warnings)
-        except Skip as skip:
-            tag = {"duplicate": "DUP", "labeldup": "LABELDUP",
-                   "conflict": "CONFLICT", "quarantined": "QUARANTINE",
-                   "undecided": "UNDECIDED", "failed": "FAIL"}[skip.verdict]
-            print(f"{tag} {skip}")
-            counts[skip.verdict] += 1
-            if skip.verdict == "duplicate" and not args.copy:
-                source.unlink()
-            elif skip.verdict in {"labeldup", "quarantined"}:
-                target_dir = DROPZONE / ("duplicate" if skip.verdict == "labeldup"
-                                         else "quarantine")
-                target_dir.mkdir(parents=True, exist_ok=True)
-                target = target_dir / source.name
-                number = 1
-                while target.exists() or target.is_symlink():
-                    target = target_dir / f"{source.stem}.{number}{source.suffix}"
-                    number += 1
-                shutil.move(str(source), str(target))
-                print(f"  moved to {target}")
-            continue
-        catwrite.bump_stamp(root)
-        catwrite.sort_tree(root)
-        checksum.write_file(vdir / "entities.checksum", entries)
-        catwrite.write_xml(xml_path, root)
-        audit = self_audit(xml_path)
-        if audit:
-            for line in audit:
-                print(f"ERROR: self-audit failed: {line}", file=sys.stderr)
-            return 1
-        if not args.copy:
-            source.unlink()
-        counts[lane] += 1
-        print("OK+ artifact added to existing release" if lane == "coexist"
-              else "OK enrolled")
+    resumed = 0
+    try:
+        vdir = locator.resolve([VAULT_NAME], args.locator)[VAULT_NAME]
+        state.contained(DROPZONE, "ingest-work")
+        if (work_root / "pending.json").exists():
+            name = state.finish(vdir, DROPZONE, work_root, self_audit,
+                                recovering=True, keep_source=args.copy)
+            print(f"OK completed interrupted ingest: {name}", flush=True)
+            state.clear_work(work_root / name, work_root)
+            resumed = 1
+        root, entries, before = state.load(vdir, self_audit)
+        # Root only: keeper subdirectories are deliberately excluded.
+        inputs = sorted(path for path in DROPZONE.iterdir()
+                        if path.is_file() and path.suffix.lower() in {".nsp", ".nsz"})
+        print(f"vault:      {vdir}")
+        print(f"candidates: {len(inputs)}", flush=True)
+        if not inputs:
+            return 0
+        if not args.keys.is_file():
+            raise ValueError(f"prod.keys not found: {args.keys} (needed for CNMT identity)")
+        hashdb_dir = DB_DIR / "hashdb"
+        if args.force is None and not any(hashdb_dir.glob("*.xml")):
+            raise ValueError(f"no hashdb dats under {hashdb_dir}; run dbsync / add dats")
+        keys = KeySet.load(args.keys)
+        gate = load_hashdb(hashdb_dir) if args.force is None else HashDB()
+        titledb = TitleDB(DB_DIR / "titledb")
+        if titledb.available():
+            print(f"titledb: {DB_DIR / 'titledb'}")
+        else:
+            print("WARN: titledb region files not found; descriptions will be omitted")
+            titledb = None
+    except (OSError, ValueError, FixError, ET.ParseError, locator.LocatorError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        if (work_root / "pending.json").exists():
+            print("STOP pending ingest retained; rerun after resolving the reported problem")
+        return 2
+    except KeyboardInterrupt:
+        print("\nInterrupted before new ingest; sources retained")
+        return 130
 
-    shutil.rmtree(work_root, ignore_errors=True)
+    counts = {"enrolled": 0, "coexist": 0, "duplicate": 0, "labeldup": 0,
+              "conflict": 0, "quarantined": 0, "undecided": 0,
+              "failed": 0}
+    warnings: list[str] = []
+    interrupted = False
+    for index, source in enumerate(inputs, 1):
+        print(f"\n[{index}/{len(inputs)}] {source.name}", flush=True)
+        try:
+            if source.is_symlink():
+                raise ValueError("linked intake file; source retained")
+            source_stamp = state.fingerprint(source)
+            proposed, next_entries = deepcopy(root), dict(entries)
+            try:
+                lane = ingest_one(source, work_root, proposed, next_entries, vdir,
+                                  gate, titledb, keys, args.force, warnings)
+            except Skip as skip:
+                if state.fingerprint(source) != source_stamp:
+                    raise ValueError("source changed during inspection; retained")
+                tag = {"duplicate": "DUP", "labeldup": "LABELDUP",
+                       "conflict": "CONFLICT", "quarantined": "QUARANTINE",
+                       "undecided": "UNDECIDED",
+                       "failed": "FAIL"}[skip.verdict]
+                print(f"{tag} {skip}", flush=True)
+                route_skip(source, skip, keep_source=args.copy)
+                counts[skip.verdict] += 1
+                continue
+            added = next_entries.keys() - entries.keys()
+            if len(added) != 1:
+                raise ValueError("ingest must add exactly one artifact per checkpoint")
+            state.commit(vdir, DROPZONE, work_root, proposed, next_entries, before,
+                         source, source_stamp, added.pop(), self_audit,
+                         keep_source=args.copy)
+            root, entries = proposed, next_entries
+            before = state.metadata_hashes(vdir)
+            counts[lane] += 1
+            print("OK+ artifact added to existing release" if lane == "coexist"
+                  else "OK enrolled", flush=True)
+        except (OSError, ValueError, FixError, ET.ParseError) as exc:
+            print(f"FAIL {type(exc).__name__}: {exc}", flush=True)
+            counts["failed"] += 1
+            if (work_root / "pending.json").exists():
+                print("STOP pending ingest retained; rerun to finish this item first")
+                break
+            try:
+                unchanged = state.metadata_hashes(vdir) == before
+            except OSError:
+                unchanged = False
+            if not unchanged:
+                print("STOP bookkeeping changed or became unreadable; rerun to reload it")
+                break
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\nInterrupted; rerun to retry this item or finish its pending checkpoint")
+            break
+        finally:
+            if not (work_root / "pending.json").exists():
+                try:
+                    state.clear_work(work_root / source.name, work_root)
+                except (OSError, ValueError) as exc:
+                    warnings.append(f"work cleanup for {source.name}: {exc}")
+
     if warnings:
         print(f"\nWarnings ({len(warnings)}):")
         for warning in warnings:
             print(f"  WARN: {warning}")
     print(f"\nDone -- enrolled: {counts['enrolled']}, coexist: {counts['coexist']}, "
           f"duplicates: {counts['duplicate']}, label-dups: {counts['labeldup']}, "
-          f"quarantined: {counts['quarantined']}, undecided: {counts['undecided']}, "
-          f"conflicts: {counts['conflict']}, failed: {counts['failed']}")
+          f"quarantined: {counts['quarantined']}, "
+          f"undecided: {counts['undecided']}, "
+          f"conflicts: {counts['conflict']}, failed: {counts['failed']}, "
+          f"completed pending: {resumed}")
+    if interrupted:
+        return 130
     return 1 if counts["conflict"] or counts["failed"] or counts["quarantined"] else 0
 
 

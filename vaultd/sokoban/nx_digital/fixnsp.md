@@ -283,55 +283,89 @@ terminal hash ceremony: ingest measures the product at enrollment.
 under full verification (every NCA gamecard-oriented, rightsless, validly
 signed — re-checked at publication). Ingest honors the minted marker plus
 its own CNMT identity cross-check and does not re-verify gamecard-ness;
-known rejected hashes still quarantine in normal ingest, even for this lane;
 the dropzone is invitation-only by standing doctrine.
 
 Ingest's hashdb gate is the archival authority — including **sole authority
 over ticket bytes** for hashdb-matched content. Admission priority for one
 TitleID/version: `vanilla > [GAMECARD] > [custom tag]`. `[NoHASHDB]` /
-`[BadHASHDB]` are file-level provenance markers for MIA work; hashdb
-`[h]`/isHack and bad-ticket rows are rejection records, not admission
-records. The loader checks explicit `isHack` / `isBadTicket` booleans,
-`[h]` / `[b]` markers (including numbered forms) in both game and ROM names,
-and ROM `hacked` / `baddump` status. A rejected match takes precedence over
-any clean claim for the same hash. `[BASE]` is not a rejection marker.
+`[BadHASHDB]` are file-level provenance markers for MIA work.
+
+Bad-ticket, hacked and bad-dump DAT rows are **ignored as if absent**. The
+loader excludes explicit `isHack` / `isBadTicket` booleans, `[h]` / `[b]`
+markers (including numbered forms) in both game and ROM names, and ROM
+`hacked` / `baddump` status. Exclusion happens before either the SHA-1 index
+or the TID/version index is built. A rejected row cannot veto a clean row
+for the same hash or establish that a version is known. `[BASE]` is not a
+rejection marker. Startup reports the number of excluded rows.
 
 Normal hashdb admission also requires a clean matching ROM filename containing
 the input CNMT's exact `[TID]` token, case-insensitively. Other clean claimants
 are reported but cannot authorize admission. If none has the TID, the source
 stays in the dropzone as a conflict. Updates use their own TID, not the base
-entity ID.
+entity ID. Input filenames must have one unambiguous TID/version/type and
+at most one provenance marker; the CNMT must agree with that identity.
 
-The DAT ROM filenames also index recorded NSP hashes by `[TID][vN]`. In normal
-digital ingest, if the CNMT's TID/version is known but the incoming NSP SHA-1
-matches none of those hashes, the input moves to `dropzone/quarantine/` before
-compression or enrollment. An NSZ input is checked using its decompressed NSP.
-This applies even when the release has never been ingested, and when that hash
-appears elsewhere in the DATs. Multiple hashes for the same identity are allowed;
-an exact rejection-row match still takes precedence. Records marked rejected
-also establish that a TID/version is present. Only an unknown hash with an absent
-TID/version remains `UNDECIDED` in the dropzone. These checks reuse the measured
-NSP hash; no extra hashing or DAT type requirement is added. The verified
-`[GAMECARD]` lane keeps its existing no-positive-match rule because card bytes
-can differ from the digital release; exact rejected hashes still quarantine.
+The clean DAT ROM filenames also index recorded NSP hashes by `[TID][vN]`:
 
-When the same release and marker already have an enrolled NSZ, ingest cannot
-compare that stored hash directly with the incoming NSP hash (including the
-decompressed form of an incoming NSZ). It moves the input to
-`dropzone/quarantine/` as an unverified overlap, without compressing it or
-decompressing the enrolled copy. This does not assert a duplicate or different
-game content. The enrolled artifact and bookkeeping stay unchanged. Quarantine
-and label-duplicate moves retain existing same-named files by choosing a numbered
-filename for the incoming file.
+- **Real database mismatch:** clean rows exist for the input CNMT's TID/version,
+  but none has the input NSP SHA-1. Move to `dropzone/quarantine/` before
+  compression or enrollment, even if the version has never been ingested.
+- **No eligible reference:** neither an eligible hash match nor a clean record
+  for the TID/version exists. Leave `UNDECIDED` in the dropzone root for a
+  fresher DAT or an explicit forced label. Rejected-only references count
+  as absent.
+- **Enrollment conflict:** the admitted incoming artifact collides with an
+  enrolled release and marker. Different comparable bytes and an unverified
+  NSP/NSZ overlap both report `CONFLICT`, with the specific reason in the log.
+  Retain the source in the dropzone root for manual resolution. An overlap
+  does not assert different content or a database mismatch; no compression
+  or decompression of the enrolled copy is attempted.
 
-`--force LABEL` is the operator's explicit hashdb override, including the DAT
-filename TID check and known-version hash mismatch: clean, rejected,
-and absent hashes all use the chosen label. This lane does not require or load
-the DATs. CNMT identity, existing-release priority/conflict checks, copying and
-bookkeeping audits still apply. It preserves a bare labeled NSP, decompressing
-an NSZ input first. Normal enrollment stores round-trip-verified NSZ (archival profile
-`-K -l 22 -t 16`); the round-trip sha1 check is ingest's own-product audit,
-not a duplication of engine work.
+An incoming NSZ uses its decompressed NSP for the database gate, then its
+original compressed bytes for comparison with an enrolled NSZ. An identical
+NSZ is a duplicate; different compressed bytes under the same marker remain
+a conflict for manual resolution. Multiple clean DAT hashes for one identity
+are allowed. These checks retain the existing exact-TID rule, without adding
+content re-verification. The verified `[GAMECARD]` lane keeps its no-positive-
+match rule because card bytes can differ from the digital release.
+
+Quarantine and label-duplicate moves preserve existing
+same-named files by choosing a numbered filename. Exact duplicates are
+removed only after checking the enrolled file's presence/size and agreement
+between XML and checksum metadata. `--copy` retains sources on success and
+exact duplication; it does not suppress keeper-area routing.
+
+`--force LABEL` remains the operator's explicit hashdb override, including
+the DAT filename TID check and known-version hash mismatch. It does not
+require or load DATs. CNMT identity, existing-release priority/conflict checks,
+copying and bookkeeping audits still apply. It preserves a bare labeled NSP,
+decompressing an NSZ input first. Labels that impersonate identity tokens or
+the verified `GAMECARD` marker are refused. Normal NSP enrollment compresses
+and round-trip verifies NSZ with `-C -K -l 22 -t 16`; an incoming NSZ is
+preserved after its own decompressed NSP passes the gate.
+
+Ingest remains a linear, one-artifact-at-a-time sweep. Each item works on a
+private catalog copy, so a failed item cannot leak declarations into a later
+commit. Metadata lookup precedes placement; only the exact destination of a
+retried input may replace an unrecorded leftover. Other undeclared release
+files are never swept away. Copying hashes the artifact in flight and checks
+the placed bytes; the source stays until bookkeeping has passed its audit.
+
+The proposed catalog is validated before either live bookkeeping file changes.
+A temporary checkpoint in `dropzone/ingest-work/` records the pending item,
+source/destination fingerprints and the proposed metadata. It is saved before
+the checksum-then-XML writes. On interruption, the next run verifies the placed
+artifact, finishes those writes and removes the original source last, before
+starting new candidates. Changed source/destination fingerprints or outside
+bookkeeping edits stop recovery for inspection. Ordinary commits add no recovery hash pass;
+that pass runs only for an interrupted checkpoint. The vault still has just
+`datmeta.xml` and `entities.checksum` as its bookkeeping files.
+
+Malformed containers and per-item I/O failures are logged and counted without
+aborting unrelated candidates. An unfinished checkpoint stops the batch to
+preserve ordering. The final digest separates real quarantine, `UNDECIDED`
+for missing clean hashdb evidence, conflicts (including format overlaps), and
+failures. Conflicts return a nonzero exit status; their sources remain in place.
 
 ## Duplications eliminated (and what is kept deliberately)
 
