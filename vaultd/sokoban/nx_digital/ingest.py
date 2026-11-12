@@ -58,7 +58,7 @@ TYPE_RE = re.compile(r"\[(BASE|UPD|DLC)\]", re.IGNORECASE)
 MARKER_RE = re.compile(r"\[([A-Za-z0-9][A-Za-z0-9_-]*)\]")
 LABEL_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 REJECT_ROW_RE = re.compile(r"\[(?:b|h)\d*\]", re.IGNORECASE)
-TYPE_BY_CNMT = {0x80: "BASE", 0x81: "UPD", 0x82: "DLC"}
+TYPE_BY_CNMT = {0x80: "BASE", 0x81: "UPD", 0x82: "DLC", 0x84: "UPD"}
 
 
 class Skip(Exception):
@@ -491,6 +491,8 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
     if rel_path in entries:
         raise Skip("failed", f"target already recorded outside the selected release: {rel_path}")
     dest = destination(vdir, rel_path)
+    if dest.exists() or dest.is_symlink():
+        raise Skip("failed", f"unrecorded destination already exists: {dest}")
 
     # Complete metadata lookup before touching the payload. The caller supplies
     # a private catalog copy, discarded on failure.
@@ -515,10 +517,8 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
     if artifact == source and source_nsz_digest is not None \
             and placed["sha1"] != source_nsz_digest["sha1"]:
         raise Skip("failed", "NSZ changed after comparison")
-    if hashing.digest(temporary, crc=True, md5=True, sha1=True) != placed:
-        raise Skip("failed", "placed bytes differ from verified artifact")
-    # Replace only this input's exact unrecorded destination (interrupted copy).
-    # Never sweep other undeclared files from the release directory.
+    # digest_stream measured the bytes actually written. Do not add a second
+    # full-file read before publishing the same temporary.
     temporary.replace(dest)
 
     # --- enroll phase ---

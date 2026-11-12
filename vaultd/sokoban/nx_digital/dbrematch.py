@@ -214,15 +214,25 @@ def finish_checkpoint(vault: Path, work_root: Path, *, recovering: bool) -> str:
         raise ValueError("pending checkpoint belongs to another vault")
     old = contained(vault / "entities", record["old"])
     new = contained(vault / "entities", record["new"])
+    temporary_rel = record.get("temporary")
+    if not isinstance(temporary_rel, str):
+        # Checkpoints written by the preceding implementation already placed
+        # the final NSZ before recording pending.json.
+        temporary_rel = str(
+            Path(record["new"]).with_name(Path(record["new"]).name + ".dbrematch.tmp")
+        ).replace("\\", "/")
+    temporary = contained(vault / "entities", temporary_rel)
     log(f"{'RESUME' if recovering else 'CHECKPOINT'} {record['old']} -> {new.name}")
     if old.exists() and fingerprint(old) != record["source_stamp"]:
         raise ValueError("labeled source changed; checkpoint retained for inspection")
+    if temporary.exists():
+        if new.exists():
+            raise ValueError("both temporary and final NSZ exist; checkpoint retained")
+        temporary.replace(new)
+    elif not new.is_file():
+        raise ValueError("pending NSZ is missing; checkpoint retained")
     if fingerprint(new) != record["target_stamp"]:
         raise ValueError("placed NSZ changed; checkpoint retained for inspection")
-    if recovering:
-        log("  VERIFY resumed NSZ against its checkpoint hashes")
-        if hashing.digest(new, crc=True, md5=True, sha1=True) != record["digest"]:
-            raise ValueError("placed NSZ differs from checkpoint hashes")
     payloads = {}
     for name, expected in record["metadata"].items():
         if name not in {"datmeta.xml", "entities.checksum"}:
@@ -277,6 +287,8 @@ def convert(item: Candidate, vault: Path, work_root: Path, root, entries, before
     if new_rel in entries:
         raise ValueError("target already has a checksum record")
     new = contained(vault / "entities", new_rel)
+    if new.exists() or new.is_symlink():
+        raise ValueError("unrecorded target already exists; refusing to overwrite it")
     work = work_root / "conversion"
     wipe_work(work, work_root)
     log(f"  CONVERT {item.name} -> {new_name}")
@@ -286,11 +298,6 @@ def convert(item: Candidate, vault: Path, work_root: Path, root, entries, before
     temporary = new.with_name(new.name + ".dbrematch.tmp")
     with artifact.open("rb") as source, temporary.open("wb") as output:
         copied = hashing.digest_stream(source, output=output, crc=True, md5=True, sha1=True)
-    log("  VERIFY copied NSZ")
-    if hashing.digest(temporary, crc=True, md5=True, sha1=True) != copied:
-        temporary.unlink()
-        raise ValueError("copied bytes differ from verified NSZ")
-    temporary.replace(new)
     if fingerprint(old) != source_stamp:
         raise ValueError("source changed during conversion")
     proposed = ET.fromstring(ET.tostring(root))
@@ -316,8 +323,10 @@ def convert(item: Candidate, vault: Path, work_root: Path, root, entries, before
     metadata = {name: {"before": before[name],
                        "after": sha256_bytes((checkpoint / name).read_bytes())}
                 for name in ("entities.checksum", "datmeta.xml")}
+    temporary_rel = str(Path(item.relative).with_name(temporary.name)).replace("\\", "/")
     record = {"vault": str(vault.resolve()), "old": item.relative, "new": new_rel,
-              "source_stamp": source_stamp, "target_stamp": fingerprint(new),
+              "temporary": temporary_rel,
+              "source_stamp": source_stamp, "target_stamp": fingerprint(temporary),
               "digest": copied, "metadata": metadata}
     atomic_bytes(work_root / "pending.json", json.dumps(record, indent=2).encode("utf-8"))
     return finish_checkpoint(vault, work_root, recovering=False)

@@ -73,13 +73,36 @@ class TitleDB:
             except (OSError, ValueError) as exc:
                 print(f"titledb: failed to load {path.name}: {exc}", file=sys.stderr)
                 data = {}
-            for record in data.values():
-                title_id = record.get("id")
-                if not title_id:
+            if not isinstance(data, dict):
+                print(f"titledb: failed to load {path.name}: JSON root is not an object",
+                      file=sys.stderr)
+                data = {}
+            selected: dict[str, tuple[tuple[int, int | str, str, str],
+                                      tuple[str, str]]] = {}
+            for source_key, record in data.items():
+                if not isinstance(record, dict):
                     continue
-                mapping.setdefault(
-                    title_id.upper(),
-                    (record.get("name") or "", record.get("publisher") or ""))
+                title_id = record.get("id")
+                name = record.get("name") or ""
+                if not title_id or not name:
+                    continue
+                publisher = record.get("publisher") or ""
+                raw_nsu = record.get("nsuId", source_key)
+                try:
+                    nsu_rank: tuple[int, int | str] = (0, int(raw_nsu))
+                except (TypeError, ValueError):
+                    nsu_rank = (1, str(raw_nsu))
+                # One content TitleID can back several storefront listings
+                # (bundle, retail pseudo-entry, or Switch 2 Edition). The
+                # lowest numeric NSU ID is the stable original listing in the
+                # synced corpus; make that rule explicit instead of trusting
+                # JSON insertion order.
+                rank = (*nsu_rank, name.casefold(), publisher.casefold())
+                tid = str(title_id).upper()
+                candidate = (rank, (name, publisher))
+                if tid not in selected or candidate[0] < selected[tid][0]:
+                    selected[tid] = candidate
+            mapping = {title_id: value for title_id, (_, value) in selected.items()}
         self._cache[region] = mapping
         return mapping
 

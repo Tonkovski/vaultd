@@ -4,7 +4,7 @@ Run `python -m vaultd.sokoban.nx_digital.dbrematch` from the checkout.
 `--locator PATH` selects another locator. The command modifies the bound NX
 digital vault; it has no force option.
 
-The sweep targets custom-labeled files such as `[NoHASHDB]` and `[BadTicket]`.
+The sweep targets custom-labeled files such as `[NoHASHDB]` and `[BadHASHDB]`.
 Vanilla and `[GAMECARD]` entries are skipped and counted. Only a labeled bare
 NSP can be converted: a stored NSZ hash cannot be compared with an NSP DAT hash.
 
@@ -55,22 +55,26 @@ failure; a failed recovery cannot inflate the inspected count.
 Only the current conversion uses `dropzone/dbrematch-work/conversion/`.
 An unrelated file in the release directory is never swept away.
 
-After copying and verifying the NSZ, the command prepares complete XML and
+While copying the NSZ to its same-directory temporary, the command calculates
+its catalog hashes in that single pass. It then prepares complete XML and
 checksum snapshots under `dropzone/dbrematch-work/checkpoint/`, validates the
-proposed XML, then atomically writes `pending.json`. It publishes checksums first,
-then XML, audits the saved catalog, removes the labeled NSP last, and clears the
-pending record. The vault keeps its existing two-file bookkeeping structure.
+proposed XML, and atomically writes `pending.json`. Only then is the temporary
+renamed to its canonical path. It publishes checksums first, then XML, audits
+the saved catalog, removes the labeled NSP last, and clears the pending record.
+Recovery reuses the placed NSZ without rehashing or recompressing it. The vault
+keeps its existing two-file bookkeeping structure.
 
 Rerunning finishes a pending conversion before looking for new candidates. It
-checks the bound vault, source/target file stamps, target hashes, snapshot hashes
-and the current metadata. Metadata must match either the pre-conversion or
+checks the bound vault, source/target file fingerprints, snapshot hashes and the
+current metadata. Metadata must match either the pre-conversion or
 post-conversion snapshot; external changes stop recovery instead of being
 overwritten. `RESUMED` identifies a completed recovery in the final digest.
 
-A failure before the pending record leaves the original catalog/source intact
-and may leave an unrecorded output that the next attempt replaces. Once a pending
-record exists, any failure stops the sweep: later candidates cannot overwrite
-the recovery material. Keep `dbrematch-work` until the pending item is resolved.
+A failure before the pending record leaves the original catalog/source intact.
+An unexplained file already occupying the canonical target is never replaced;
+the item stops for manual inspection. Once a pending record exists, any failure
+stops the sweep: later candidates cannot overwrite the recovery material. Keep
+`dbrematch-work` until the pending item is resolved.
 
 Exit codes: 0 for a completed sweep (including kept/rejected/blocked items),
 1 for errors, 2 for locator/argument setup errors, and 130 for interruption.

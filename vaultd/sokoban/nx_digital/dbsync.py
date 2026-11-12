@@ -46,7 +46,11 @@ def report_hashdb(hashdb: Path) -> bool:
         if match is None:
             print(f"  {dat.name}: no datestamp in filename")
             continue
-        stamp = datetime.strptime(match.group(1), "%Y%m%d").date()
+        try:
+            stamp = datetime.strptime(match.group(1), "%Y%m%d").date()
+        except ValueError:
+            print(f"  {dat.name}: invalid datestamp in filename")
+            continue
         age = (date.today() - stamp).days
         marker = "  <- STALE, refresh manually" if age > HASHDB_STALE_DAYS else ""
         stale |= age > HASHDB_STALE_DAYS

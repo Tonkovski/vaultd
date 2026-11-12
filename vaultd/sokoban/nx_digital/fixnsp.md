@@ -73,7 +73,10 @@ copies are needed. Original names remain diagnostic labels; canonical member
 names are generated only when writing the output NSP. A malformed or incomplete
 group does not block unrelated complete groups. An unrecoverable identifiable
 Meta remains a failed attempt. Unreferenced signed candidates are reported,
-never guessed into a group. Grouping and publication do not rerun recovery.
+never guessed into a group. Unreadable NCAs, unsupported container members,
+unreadable tickets and unreferenced signed NCAs are source-level errors: valid
+independent groups may still publish, but the source container is not archived.
+Grouping and publication do not rerun recovery.
 
 ## Step 3 — Meta parsing under declared geometry
 
@@ -267,14 +270,16 @@ recovery key material must also be consistent across the group's members.
 
 Ticket titlekey type is checked before any courier decryption. Only common
 (type 0) tickets expose a 16-byte encrypted titlekey. Personalized (type 1)
-tickets carry a console-specific RSA-OAEP block; fixnsp does not implement its
-unwrapping and must report that unsupported conversion explicitly, not diagnose
-the wrapped bytes as a corrupt titlekey. Unknown titlekey types are likewise
-unusable. Unsupported candidates cannot hide a usable common ticket, and
-independently recovered key material can still produce a BASE/DLC public ticket.
-UPD still requires its original signed common ticket. Final output tickets must
-also be common. The parser rejects unsupported signature layouts rather than
-interpreting their bytes at RSA-2048/SHA-256 offsets.
+tickets carry a console-specific RSA-OAEP block and are never treated as common
+ticket material. When the matching RightsId exists in optional `title.keys`, its
+conventional titlekek-encrypted value is decrypted for the same signed NCA
+generation and must pass every referenced rights-bearing NCA probe before it can
+regenerate a BASE/DLC public ticket. Without that external entry, conversion is
+reported as unsupported rather than misdiagnosing the wrapped bytes as a corrupt
+titlekey. Unknown titlekey types are likewise unusable. UPD still requires its
+original signed common ticket; `title.keys` cannot synthesize it. Final output
+tickets must be common. The parser rejects unsupported signature layouts rather
+than interpreting their bytes at RSA-2048/SHA-256 offsets.
 
 ## Step 9 — GAMECARD groups
 
@@ -291,7 +296,8 @@ this. An all-gamecard, rightsless, fully signed group publishes as
 The GAMECARD mark is never anything but fully signed. Mixed
 gamecard/download groups are rejected.
 
-Version labels (from the dumper's own naming code): a card's `[vN]` is the
+Patch (0x81) and DataPatch (0x84) CNMTs both use the `UPD` lane. Version labels
+(from the dumper's own naming code): a card's `[vN]` is the
 patch's version when the card carries a pre-installed patch, else the
 application's own version. Both non-v0 causes are real and legitimate:
 base-v0 + card-shipped patch (a reproducible rights-bearing UPD title with
@@ -407,10 +413,11 @@ preserved after its own decompressed NSP passes the gate.
 
 Ingest remains a linear, one-artifact-at-a-time sweep. Each item works on a
 private catalog copy, so a failed item cannot leak declarations into a later
-commit. Metadata lookup precedes placement; only the exact destination of a
-retried input may replace an unrecorded leftover. Other undeclared release
-files are never swept away. Copying hashes the artifact in flight and checks
-the placed bytes; the source stays until bookkeeping has passed its audit.
+commit. Metadata lookup precedes placement. An unrecorded canonical destination
+is never replaced automatically; it stops for inspection. Other undeclared
+release files are never swept away. Copying hashes the bytes accepted by the
+destination stream in that one pass; the source stays until bookkeeping has
+passed its audit.
 
 The proposed catalog is validated before either live bookkeeping file changes.
 A temporary checkpoint in `dropzone/ingest-work/` records the pending item,

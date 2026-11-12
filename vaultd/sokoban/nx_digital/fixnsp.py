@@ -92,7 +92,7 @@ NCA_HEADER_FIXED_KEY_MODULI = tuple(
     )
 )
 
-TITLE_TYPE_NAMES = {0x80: "BASE", 0x81: "UPD", 0x82: "DLC"}
+TITLE_TYPE_NAMES = {0x80: "BASE", 0x81: "UPD", 0x82: "DLC", 0x84: "UPD"}
 NCA_CONTENT_NAMES = {0: "PROGRAM", 1: "META", 2: "CONTROL", 3: "MANUAL",
                      4: "DATA", 5: "PUBLICDATA"}
 TITLE_BEARING_NCA_TYPES = {0, 4, 5}
@@ -207,6 +207,27 @@ class KeySet:
                             self.require("aes_kek_generation_source"))
         second = ecb_decrypt(first, self.require(source_names[key_index]))
         return ecb_decrypt(second, self.require("aes_key_generation_source"))
+
+
+@dataclass(frozen=True)
+class TitleKeys:
+    """Optional title.keys material, indexed by RightsId.
+
+    Values use the conventional title.keys representation: the titlekek-
+    encrypted 16-byte title key, not plaintext key material.
+    """
+    values: dict[str, bytes]
+
+    @classmethod
+    def load(cls, path: Path | None) -> "TitleKeys":
+        values: dict[str, bytes] = {}
+        if path is None or not path.is_file():
+            return cls(values)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            match = KEY_LINE_RE.match(line)
+            if match and len(match.group(1)) == 32 and len(match.group(2)) == 32:
+                values[match.group(1).lower()] = bytes.fromhex(match.group(2))
+        return cls(values)
 
 
 # --------------------------------------------------------------------------
@@ -622,6 +643,16 @@ class NcaHeader:
         return self.decrypted_key_area[2]
 
 
+def validate_signed_nca_header(header: NcaHeader) -> None:
+    """Reject signed but nonconforming header enums before grouping."""
+    if header.distribution_type not in {0, 1}:
+        raise FixError(f"invalid NCA distribution type: {header.distribution_type}")
+    if header.content_type not in NCA_CONTENT_NAMES:
+        raise FixError(f"invalid NCA content type: {header.content_type}")
+    if header.key_index not in {0, 1, 2}:
+        raise FixError(f"invalid NCA key index: {header.key_index}")
+
+
 def expected_rights_id_generation(key_generation: int) -> int:
     if key_generation < 0:
         raise FixError(f"invalid NCA key generation: {key_generation}")
@@ -921,7 +952,7 @@ def parse_cnmt_payload(payload: bytes) -> CnmtInfo:
     required_system_version = None
     required_application_version = None
     field_offsets = {"titleType": 0x0C}
-    if title_type in (0x80, 0x81) and len(extended) >= 0x0C:
+    if title_type in (0x80, 0x81, 0x84) and len(extended) >= 0x0C:
         required_system_version = struct.unpack_from("<I", extended, 0x08)[0]
         field_offsets["requiredSystemVersion"] = 0x20 + 0x08
     elif title_type == 0x82 and len(extended) >= 0x10:
@@ -971,15 +1002,28 @@ class CnmtKnowledgeBase:
     path: Path
     _records: dict[str, object] | None = field(default=None, init=False, repr=False)
     _system_versions: tuple[int, ...] | None = field(default=None, init=False, repr=False)
+    _load_error: str | None = field(default=None, init=False, repr=False)
 
     def _load(self) -> dict[str, object]:
         if self._records is None:
             if not self.path.exists():
                 self._records = {}
             else:
-                loaded = json.loads(self.path.read_text(encoding="utf-8"))
-                self._records = loaded if isinstance(loaded, dict) else {}
+                try:
+                    loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                except (OSError, ValueError) as exc:
+                    self._load_error = f"{self.path}: {exc}"
+                    loaded = {}
+                if not isinstance(loaded, dict):
+                    self._load_error = f"{self.path}: JSON root is not an object"
+                    loaded = {}
+                self._records = loaded
         return self._records
+
+    @property
+    def load_error(self) -> str | None:
+        self._load()
+        return self._load_error
 
     def record_exists(self, info: CnmtInfo) -> bool:
         title_records = self._load().get(info.title_id.lower())
@@ -1194,11 +1238,14 @@ def validate_meta_hash_layers(header: NcaHeader, section: NcaSection,
         raise FixError(f"Meta NCA section-header hash mismatch: {header.path.name}")
 
 
-def read_meta_payload(path: Path, keys: KeySet) -> MetaPayload:
+def read_meta_payload(path: Path, keys: KeySet, *,
+                      allow_extra_sections: bool = False) -> MetaPayload:
     header = read_nca_header(path, keys)
-    if header.content_type != 1 or len(header.sections) != 1:
+    section_zero = [section for section in header.sections if section.index == 0]
+    if (header.content_type != 1 or len(section_zero) != 1
+            or (not allow_extra_sections and len(header.sections) != 1)):
         raise FixError(f"expected an ordinary single-section Meta NCA: {path.name}")
-    section = header.sections[0]
+    section = section_zero[0]
     hash_layout = read_meta_hash_layout(header, section)
     plain = read_nca_section(header, section, keys)
     validate_meta_hash_layers(header, section, plain)
@@ -1273,6 +1320,45 @@ def rebuild_meta_layers(meta: MetaPayload, patched_payload: bytes,
     return bytes(plain), raw
 
 
+def canonicalize_unsigned_meta(meta: MetaPayload, plain: bytes,
+                               raw: bytearray) -> tuple[bytes, bytearray, bool]:
+    """Restore convention-defined bytes not covered by Meta's data layers.
+
+    This is only a repair candidate. The Nintendo main signature still decides
+    whether the zeroed header bytes are authentic.
+    """
+    changed = False
+    if any(raw[0x100:0x200]):
+        raw[0x100:0x200] = bytes(0x100)
+        changed = True
+    for index in range(1, 4):
+        table = 0x240 + index * 0x10
+        if any(raw[table:table + 0x10]):
+            raw[table:table + 0x10] = bytes(0x10)
+            changed = True
+        start = 0x400 + index * 0x200
+        if any(raw[start:start + 0x200]):
+            raw[start:start + 0x200] = bytes(0x200)
+            changed = True
+    mutable = bytearray(plain)
+    occupied = sorted((
+        (meta.hash_layout.hash_offset,
+         meta.hash_layout.hash_offset + meta.hash_layout.hash_size),
+        (meta.hash_layout.data_offset,
+         meta.hash_layout.data_offset + meta.hash_layout.data_size),
+    ))
+    cursor = 0
+    for start, end in occupied:
+        if any(mutable[cursor:start]):
+            mutable[cursor:start] = bytes(start - cursor)
+            changed = True
+        cursor = end
+    if any(mutable[cursor:]):
+        mutable[cursor:] = bytes(len(mutable) - cursor)
+        changed = True
+    return bytes(mutable), raw, changed
+
+
 def rebuild_meta_nca(source: Path, out_dir: Path, rewrites: list[NcaRewrite],
                      keys: KeySet, distribution_type: int | None = None) -> NcaRewrite:
     meta = read_meta_payload(source, keys)
@@ -1333,6 +1419,7 @@ class InspectionResult:
     content_paths: tuple[Path, ...]
     warnings: tuple[str, ...]
     failed_meta_attempts: tuple[str, ...]
+    errors: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1353,6 +1440,7 @@ class GroupDiscovery:
     groups: tuple[PackageGroup, ...]
     failed_attempts: tuple[str, ...]
     warnings: tuple[str, ...]
+    errors: tuple[str, ...]
 
 
 @dataclass
@@ -1546,16 +1634,26 @@ def restore_signed_header_nca(source: Path, out_dir: Path, keys: KeySet,
 
     meta = None
     if not winners and header.content_type == 1:
-        meta = read_meta_payload(source, keys)
-        for patched_payload, payload_reason in meta_payload_candidates(
-                meta, knowledge, firmware_catalog, recovered_content):
+        meta = read_meta_payload(source, keys, allow_extra_sections=True)
+        payload_candidates = [(meta.payload, "")]
+        payload_candidates.extend(meta_payload_candidates(
+            meta, knowledge, firmware_catalog, recovered_content))
+        for patched_payload, payload_reason in payload_candidates:
             for raw, rights_id, encrypted_titlekey, reason in candidates:
                 meta_plain, meta_raw = rebuild_meta_layers(
                     meta, patched_payload, raw)
+                meta_plain, meta_raw, canonicalized = canonicalize_unsigned_meta(
+                    meta, meta_plain, meta_raw)
+                if not payload_reason and not canonicalized:
+                    continue
                 if nca_main_signature_valid(meta_raw):
+                    repair_reason = "; ".join(part for part in (
+                        reason, payload_reason,
+                        "zeroed uncovered Meta bytes" if canonicalized else "")
+                        if part)
                     winners.append((meta_raw, meta_plain, rights_id,
                                     encrypted_titlekey,
-                                    f"{reason}; {payload_reason}"))
+                                    repair_reason))
             if winners:
                 break
 
@@ -1605,10 +1703,13 @@ _NSZ_BOOTSTRAP = ("import sys; from vaultd.sokoban.nx_digital.nsz_codec import m
 
 
 def decompress_nsz(source: Path, out_dir: Path) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
     result = subprocess.run(
         [sys.executable, "-c", _NSZ_BOOTSTRAP, "-D", "--machine-readable",
          "-o", str(out_dir), str(source)],
+        cwd=REPO_ROOT,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         encoding="utf-8", errors="replace")
@@ -1625,8 +1726,13 @@ def decompress_nsz(source: Path, out_dir: Path) -> Path:
 
 
 def rejoin_split_nsp(source_dir: Path, work: Path) -> Path:
-    parts = sorted(item for item in source_dir.iterdir()
-                   if item.is_file() and re.fullmatch(r"\d{2}", item.name))
+    members = sorted(source_dir.iterdir())
+    unexpected = [item.name for item in members
+                  if not item.is_file() or re.fullmatch(r"\d{2}", item.name) is None]
+    if unexpected:
+        raise FixError("split NSP directory contains unexpected member(s): "
+                       + ", ".join(unexpected))
+    parts = members
     if not parts:
         raise FixError(f"split NSP directory has no numeric parts: {source_dir.name}")
     expected = [f"{index:02d}" for index in range(len(parts))]
@@ -1649,6 +1755,10 @@ def prepare_input(source: Path, work_root: Path, keep_work: bool
                   ) -> tuple[str, Path, tuple[str, ...]]:
     suffix = source.suffix.lower()
     work = work_root / source.name
+    resolved_source, resolved_work = source.resolve(), work.resolve()
+    if (resolved_work == resolved_source
+            or (source.is_dir() and resolved_source in resolved_work.parents)):
+        raise FixError(f"work path overlaps input source: {work}")
     if work.exists() and not keep_work:
         shutil.rmtree(work)
     work.mkdir(parents=True, exist_ok=True)
@@ -1690,11 +1800,12 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
                  knowledge: CnmtKnowledgeBase | None,
                  firmware_catalog: tuple[int, ...], *,
                  content_paths: tuple[Path, ...] | None = None
-                 ) -> tuple[dict[str, NcaArtifact], list[str], list[str]]:
+                 ) -> tuple[dict[str, NcaArtifact], list[str], list[str], list[str]]:
     """One source inventory: recover all content before any Meta; names are labels."""
     artifacts: dict[str, NcaArtifact] = {}
     warnings: list[str] = []
     failed_meta_attempts: list[str] = []
+    errors: list[str] = []
     recovery_dir = scope_path.parent / f"{scope_path.name}-header-recovery"
 
     def register(artifact: NcaArtifact) -> None:
@@ -1711,8 +1822,13 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
 
     readable = []
     for root in content_paths or (scope_path,):
-        for path in sorted(p for p in root.rglob("*")
-                           if p.is_file() and p.suffix.lower() == ".nca"):
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            if path.suffix.lower() not in {".nca", ".tik", ".cert"}:
+                errors.append(
+                    f"unsupported container member left unused: {path}")
+                continue
+            if path.suffix.lower() != ".nca":
+                continue
             try:
                 digest = sha256_file(path)
                 header = read_nca_header(path, keys)
@@ -1721,7 +1837,7 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
                 # If the header cannot be read, the suffix is only a diagnostic
                 # hint that a Meta attempt failed; it never authorizes content.
                 (failed_meta_attempts if path.name.lower().endswith(".cnmt.nca")
-                 else warnings).append(detail)
+                 else errors).append(detail)
                 continue
             readable.append((path, digest, header))
 
@@ -1739,6 +1855,7 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
         try:
             verification = NcaVerification(path, nca_main_signature_valid(header.raw))
             if verification.main_signature_valid:
+                validate_signed_nca_header(header)
                 artifact = NcaArtifact(path, header, verification, digest, digest[:32],
                                        origins=(path,))
             else:
@@ -1752,6 +1869,7 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
                 verification = verify_nca_file(rewrite.output, keys)
                 if not verification.main_signature_valid:
                     raise FixError("recovery failed final signature verification")
+                validate_signed_nca_header(restored_header)
                 artifact = NcaArtifact(
                     rewrite.output, restored_header, verification, rewrite.new_hash,
                     rewrite.new_id, rewrite, reason, (path,), (rewrite,))
@@ -1761,21 +1879,22 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
             register(artifact)
         except (FixError, OSError, ValueError) as exc:
             detail = f"NCA left unused: {path}; {exc}"
-            (failed_meta_attempts if header.content_type == 1 else warnings).append(detail)
-    return artifacts, warnings, failed_meta_attempts
+            (failed_meta_attempts if header.content_type == 1 else errors).append(detail)
+    return artifacts, warnings, failed_meta_attempts, errors
 
 
 def inspect_container(extract_dir: Path, container_type: str, keys: KeySet,
                       knowledge: CnmtKnowledgeBase | None,
                       firmware_catalog: tuple[int, ...]) -> InspectionResult:
     paths = content_scope_paths(extract_dir, container_type)
-    artifacts, warnings, failures = inspect_ncas(
+    artifacts, warnings, failures, errors = inspect_ncas(
         extract_dir, keys, knowledge, firmware_catalog, content_paths=paths)
     if container_type in {"XCI", "XCZ"} and (extract_dir / "update").is_dir():
         warnings.append("XCI update partition left untouched")
     if not artifacts:
         warnings.append("input has no usable NCAs after verification/recovery")
-    return InspectionResult(artifacts, paths, tuple(warnings), tuple(failures))
+    return InspectionResult(
+        artifacts, paths, tuple(warnings), tuple(failures), tuple(errors))
 
 
 def discover_groups(source: Path, container_type: str,
@@ -1784,6 +1903,7 @@ def discover_groups(source: Path, container_type: str,
     groups: list[PackageGroup] = []
     failed_attempts = list(inspection.failed_meta_attempts)
     warnings: list[str] = []
+    errors: list[str] = []
     tickets: dict[str, TicketInfo] = {}
     certs: list[Path] = []
     for root in inspection.content_paths:
@@ -1793,7 +1913,7 @@ def discover_groups(source: Path, container_type: str,
                     ticket = parse_ticket(path)
                     tickets.setdefault(sha256_file(path), ticket)
                 except (FixError, OSError, ValueError) as exc:
-                    warnings.append(f"unreadable ticket left unused: {path}: {exc}")
+                    errors.append(f"unreadable ticket left unused: {path}: {exc}")
             elif path.suffix.lower() == ".cert":
                 certs.append(path)
     referenced: set[str] = set()
@@ -1831,9 +1951,19 @@ def discover_groups(source: Path, container_type: str,
     orphaned = set(inspection.artifacts) - referenced - meta_hashes
     if orphaned:
         shown = ", ".join(item[:32] for item in sorted(orphaned)[:5])
-        warnings.append(f"{len(orphaned)} unreferenced signed NCA candidate(s) "
-                        f"left unused in this input: {shown}")
-    return GroupDiscovery(tuple(groups), tuple(failed_attempts), tuple(warnings))
+        errors.append(f"{len(orphaned)} unreferenced signed NCA candidate(s) "
+                      f"left unused in this input: {shown}")
+    used_rights = {artifact.header.rights_id for group in groups
+                   for artifact in group.content if artifact.header.rights_id}
+    if used_rights:
+        unused_tickets = [ticket.path.name for ticket in tickets.values()
+                          if ticket.rights_id not in used_rights]
+        if unused_tickets:
+            shown = ", ".join(sorted(unused_tickets)[:5])
+            errors.append(f"{len(unused_tickets)} ticket(s) do not apply to any "
+                          f"discovered title-rights group: {shown}")
+    return GroupDiscovery(
+        tuple(groups), tuple(failed_attempts), tuple(warnings), tuple(errors))
 
 
 # --------------------------------------------------------------------------
@@ -1941,7 +2071,8 @@ def classify_missing_content(info: CnmtInfo, missing_entries: tuple[CnmtEntry, .
 
 
 def build_repair_plan(group: PackageGroup, group_work: Path, keys: KeySet,
-                      default_cert: Path) -> RepairPlan:
+                      default_cert: Path,
+                      title_keys: TitleKeys | None = None) -> RepairPlan:
     info = group.meta.info
     plan = RepairPlan(
         group=group, outcome=Outcome.PRESERVE,
@@ -2025,6 +2156,25 @@ def build_repair_plan(group: PackageGroup, group_work: Path, keys: KeySet,
     if len(materials) > 1:
         raise FixError("recovered content disagrees on encrypted titlekey")
     ticket_material = next(iter(materials), None)
+    has_personalized_ticket = bool(rights_id) and any(
+        ticket.rights_id.lower() == rights_id.lower() and ticket.titlekey_type == 1
+        for ticket in group.tickets)
+    if (rights_id and ticket_generation is not None and has_personalized_ticket
+            and title_keys is not None and rights_id.lower() in title_keys.values):
+        external = title_keys.values[rights_id.lower()]
+        try:
+            plain = ecb_decrypt(keys.titlekek(max(ticket_generation - 1, 0)), external)
+            relevant = [header for header in output_headers
+                        if header.rights_id == rights_id]
+            if relevant and all(probe_titlekey(header, plain) for header in relevant):
+                if ticket_material is not None and ticket_material != external:
+                    raise FixError("recovered content and title.keys disagree on titlekey")
+                ticket_material = external
+            elif info.type_name in {"BASE", "DLC"} and ticket_material is None:
+                raise FixError(
+                    f"title.keys entry for RightsId {rights_id} fails the signed NCA probe")
+        except (ValueError, OSError) as exc:
+            raise FixError(f"invalid title.keys entry for RightsId {rights_id}") from exc
     existing_ticket = None
     if rights_id and (info.type_name == "UPD" or ticket_material is None):
         existing_ticket = matching_ticket(group, rights_id, output_headers, keys)
@@ -2259,7 +2409,7 @@ def print_plan(plan: RepairPlan) -> None:
     if plan.ticket_path is not None:
         print(f"    TICKET     {plan.ticket_path.name}")
     for warning in plan.warnings:
-        print(f"  warn:    {warning}")
+        print(f"  WARNING: {warning}")
     for failure in plan.failures:
         print(f"  FAIL:    {failure}")
     print(f"  outcome: {plan.outcome.value}")
@@ -2293,6 +2443,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--titledb", type=Path, default=DB_DIR / "titledb")
     parser.add_argument("--keys", type=Path,
                         default=Path.home() / ".switch" / "prod.keys")
+    parser.add_argument("--title-keys", type=Path,
+                        default=Path.home() / ".switch" / "title.keys")
     parser.add_argument("--cert", type=Path, default=DEFAULT_CERT)
     parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
@@ -2306,15 +2458,34 @@ def main(argv: list[str] | None = None) -> int:
     if not args.keys.exists():
         print(f"FAIL: prod.keys not found: {args.keys}", file=sys.stderr)
         return 2
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    args.work_dir.mkdir(parents=True, exist_ok=True)
     inputs = list(args.input) if args.input else discover_inputs(args.intake)
     if not inputs:
         print(f"no NSP/NSZ/XCI/XCZ inputs found in {args.intake}")
         return 0
 
+    protected_sources = tuple((source.resolve(), source.is_dir()) for source in inputs)
+    if len({path for path, _ in protected_sources}) != len(protected_sources):
+        print("FAIL: the same input was supplied more than once", file=sys.stderr)
+        return 2
+    for label, root in (("work", args.work_dir), ("output", args.out_dir),
+                        ("success", args.success_dir)):
+        resolved_root = root.resolve()
+        for protected, is_directory in protected_sources:
+            if (resolved_root == protected
+                    or (is_directory and protected in resolved_root.parents)):
+                print(f"FAIL: {label} directory overlaps input source: {root}",
+                      file=sys.stderr)
+                return 2
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    args.work_dir.mkdir(parents=True, exist_ok=True)
+
     keys = KeySet.load(args.keys)
+    title_keys = TitleKeys.load(args.title_keys)
     knowledge = CnmtKnowledgeBase(args.titledb / "cnmts.json")
+    if knowledge.load_error:
+        print(f"WARNING: CNMTDB unavailable; continuing without its repair "
+              f"proposals: {knowledge.load_error}")
     firmware_catalog = load_firmware_catalog(DB_DIR / "firmware_versions.json")
     attempted = completed = failed = source_failures = archive_failures = 0
     for source in inputs:
@@ -2324,7 +2495,7 @@ def main(argv: list[str] | None = None) -> int:
                 source, args.work_dir, args.keep_work)
             print(f"  source:  {container_type}")
             for warning in input_warnings:
-                print(f"  warn:    {warning}")
+                print(f"  WARNING: {warning}")
             inspection = inspect_container(extract_dir, container_type, keys,
                                            knowledge, firmware_catalog)
             discovery = discover_groups(source, container_type, inspection, keys)
@@ -2334,7 +2505,13 @@ def main(argv: list[str] | None = None) -> int:
             continue
 
         for warning in (*inspection.warnings, *discovery.warnings):
-            print(f"  warn:    {warning}")
+            print(f"  WARNING: {warning}")
+        source_errors = (*inspection.errors, *discovery.errors)
+        source_has_errors = bool(source_errors)
+        if source_has_errors:
+            source_failures += 1
+            for detail in source_errors:
+                print(f"  FAIL:    source inventory: {detail}")
         print(f"  groups:  {len(discovery.groups)} readable, "
               f"{len(discovery.failed_attempts)} unreadable")
         source_attempted = source_completed = source_failed = 0
@@ -2345,7 +2522,8 @@ def main(argv: list[str] | None = None) -> int:
             source_failed += 1
             print(f"  FAIL:    Meta/CNMT attempt failed: {detail}")
         if not discovery.groups and not discovery.failed_attempts:
-            source_failures += 1
+            if not source_has_errors:
+                source_failures += 1
             print("  FAIL:    container contains no readable Meta/CNMT NCA")
             continue
 
@@ -2355,7 +2533,8 @@ def main(argv: list[str] | None = None) -> int:
             source_attempted += 1
             try:
                 group_work = source_work / f"group-{index:03d}"
-                plan = build_repair_plan(group, group_work, keys, args.cert)
+                plan = build_repair_plan(
+                    group, group_work, keys, args.cert, title_keys)
                 print_plan(plan)
                 if not plan.publishable:
                     failed += 1
@@ -2367,7 +2546,7 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     output_dir = group_output_dir(args.out_dir, group, discovery.groups)
                     if output_dir != args.out_dir:
-                        print("  warn:    distinct signed Meta variants share this release; "
+                        print("  WARNING: distinct signed Meta variants share this release; "
                               "staged separately under fixnsp-variants for manual selection")
                     destination = execute_plan(plan, group_work, output_dir,
                                                keys, args.overwrite)
@@ -2380,7 +2559,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"  FAIL:    group attempt failed: {exc}")
 
         if (not args.inspect_only and source_attempted > 0
-                and source_completed == source_attempted and source_failed == 0):
+                and source_completed == source_attempted and source_failed == 0
+                and not source_has_errors):
             try:
                 archived, moved = archive_successful_source(source, args.success_dir)
                 print(f"  input:   {'moved' if moved else 'already archived'}: {archived}")
