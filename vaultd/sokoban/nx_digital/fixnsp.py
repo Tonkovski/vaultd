@@ -2115,6 +2115,10 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
     readable = []
     for root in content_paths or (scope_path,):
         for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            if path.name.lower().endswith(".cnmt.xml"):
+                warnings.append(
+                    f"CNMT XML sidecar omitted; it restates the Meta NCA: {path}")
+                continue
             if path.suffix.lower() not in {".nca", ".tik", ".cert"}:
                 errors.append(
                     f"unsupported container member left unused: {path}")
@@ -2820,7 +2824,8 @@ def print_finding(message: str, *, indent: str = "  ") -> None:
     if is_inventory_repair_message(message):
         return
     lowered = message.lower()
-    if ("type-6 delta fragment" in lowered or "orphan ticket" in lowered
+    if ("cnmt xml sidecar" in lowered
+            or "type-6 delta fragment" in lowered or "orphan ticket" in lowered
             or "no independently readable titlekey proof" in lowered):
         label = "notice"
     elif ("ticket generation repaired" in lowered

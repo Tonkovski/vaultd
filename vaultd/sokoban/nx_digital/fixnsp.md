@@ -78,6 +78,11 @@ unreadable tickets and unreferenced signed NCAs are source-level errors: valid
 independent groups may still publish, but the source container is not archived.
 Grouping and publication do not rerun recovery.
 
+The sole explicit formatter omission is `*.cnmt.xml`: it is a dumping tool's
+restatement of the Meta NCA, not a Standard NSP member. Report it as a notice
+and leave it out of the output. Any other unsupported member remains a
+source-level error.
+
 ## Step 3 — Meta parsing under declared geometry
 
 Only NCA3 is admitted. NCA2 uses different XTS sector numbering and has no
