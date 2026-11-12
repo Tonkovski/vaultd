@@ -80,12 +80,18 @@ Grouping and publication do not rerun recovery.
 
 ## Step 3 — Meta parsing under declared geometry
 
+Only NCA3 is admitted. NCA2 uses different XTS sector numbering and has no
+authentic conversion into an NCA3 Standard NSP; it is rejected explicitly.
+
 The Meta NCA's HierarchicalSha256 layout — block size, hash offset/size,
 data offset/size — is read from the declared section header, never assumed;
 `hash_size` must equal `ceil(data_size / block_size) * 0x20`; every data
 block hash, the master hash, and the section-header digest are verified.
-Alignment gaps belong to neither declared layer and are never touched. The
-inner PFS0 is located by its declared offset.
+The inner PFS0 is located by its declared offset and every member is bounds
+checked. Exactly one member ending in `.cnmt` must exist; other inner members
+do not displace it. Its `Application` / `Patch` / `AddOnContent` / `DataPatch`
+name and title ID must agree with the parsed payload. Thus neither outer NCA
+order nor inner PFS0 position determines the group.
 
 > Lesson (Valiant Hearts / Child of Light, recovered from the fix): multi-NCA
 > titles overflow one hash block; tiny AddOnContent metas pad the other way
@@ -142,7 +148,7 @@ header bytes. Rights restoration remains restricted to the digital lane.
 > and Manual signatures. Recovery failures must report signature/identity failure
 > or the actual recovery exception, rather than presenting them as mere bad names.
 
-**Best effort, defined**: every signature-failing NCA uses one supported
+**Best effort, defined**: every signature-failing NCA3 uses one supported
 signature-driven enumeration before grouping. There is no expected-filename-ID
 lane and no second fallback pass. A successful candidate receives its actual
 hash-derived ID. A restored header is not proof of its body: publication still
@@ -174,8 +180,13 @@ parameter is out of scope by definition.
 During the second recovery pass, a signature-failing Meta may use exact
 content recoveries from anywhere in this input. Propose CNMT changes in place
 (refuse to resize), recompute hashes under the declared geometry, and require
-the Meta's Nintendo signature to return. Already-signed Meta bytes are preserved;
-no post-group metadata rewrite is performed.
+the Meta's Nintendo signature to return. Once signed, convention-defined bytes
+outside Nintendo's signed/hash-covered regions are canonicalized: signature 2,
+unused fs-header slots, and decrypted section bytes outside the hash table and
+data region are zero. Signed geometry is never rewritten: section 0 must be the
+only section, start at `0xC00`, and end at NCA EOF, or the Meta is rejected.
+Canonicalization is re-read through the same signature, hash-layer, PFS0 and
+CNMT checks before the changed hash-derived Meta ID is admitted.
 
 `RequiredSystemVersion` / `RequiredApplicationVersion` (CNMT extended
 header — protected transitively by the Meta signature; tampering is detected
@@ -224,12 +235,16 @@ is omitted with a warning.
 inherently non-reproducible; the FF common ticket is the dumper convention
 that makes dumps reproducible. Therefore every input ticket is untrusted as
 an artifact and used only as a **titlekey courier**. Titlekey values come
-from key-area derivation (deterministic from prod.keys) or from the courier —
-and every courier-sourced value passes the **titlekey probe**: decrypt the
-section's hash-table region with the candidate key and compare against the
-master hash stored in the signed NCA header. Exact cryptographic pass/fail,
-microseconds, in-house, no base-NCA dependency (BKTR exists only in UPD,
-which never takes this path). The output ticket is always regenerated:
+from signed key-area recovery (deterministic from prod.keys) or from the courier.
+Courier and `title.keys` values must pass the **titlekey proof**. Across every
+rights-bearing NCA, try every independently readable section: hash type 2 uses
+the hash table; hash type 3 uses the first block of the first level, zero-padded
+to its block size; sparse sections use the first sparse-table node. AES-CTR-EX
+is not independently readable. The rule is existential — one opening proof is
+enough; an attempted set with no opening proof rejects the key. Signed key-area
+recovery material may be used when no independent proof exists, but is rejected
+if any readable proof is attempted and all fail. The output ticket is always
+regenerated:
 canonical FF public ticket (0x2C0, issuer `Root-CA00000003-XS00000020`,
 Permanent, one RightsId, one encrypted titlekey, zero sections) from
 RightsId + titlekey + generation-from-signed-header, with the pinned
@@ -239,9 +254,12 @@ RightsId + titlekey + generation-from-signed-header, with the pinned
 **UPD** — updates ship free to every console with Nintendo's own common
 ticket: identical bytes everywhere, non-FF signature, reproducible by
 preservation. Verify the ticket RSA against the pinned issuer key (this
-authenticates the titlekey field itself — no probe needed) and copy it
-verbatim. FF, unsupported-issuer, or cryptographically invalid UPD tickets
-are irreparable; a missing UPD ticket cannot be synthesized. **Scope,
+authenticates the titlekey field itself) and run the same independent proof
+set. A readable proof that fails rejects the ticket. When no independent proof
+exists, the valid pinned Nintendo RSA signature is sufficient and the limitation
+is reported. Copy the ticket verbatim. FF, unsupported-issuer, or
+cryptographically invalid UPD tickets are irreparable; a missing UPD ticket
+cannot be synthesized. **Scope,
 evidence-corrected**: card-shipped updates are NOT rightsless — a card with a
 pre-installed patch carries the patch as title-rights content plus Nintendo's
 signed common ticket in the secure partition (observed live:
@@ -255,25 +273,26 @@ byte-reproducible because the common ticket is identical on every card.
 > hence always regenerate BASE/DLC tickets. The probe closes the one gap
 > regeneration leaves open — a corrupted titlekey inside the courier — which
 > is what keeps the [NoHASHDB] MIA lane titlekey-tight where no hashdb can
-> catch it. The original engine's full payload walk was self-contained (its
-> only waiver, "requires base NCA", is BKTR-and-therefore-UPD-only, where
-> the ticket signature is the stronger proof); the probe preserves that
-> firewall with none of the plumbing.
+> catch it. The bounded proof set preserves that firewall without a full
+> payload walk: independently readable hash/sparse proofs decide courier keys;
+> AES-CTR-EX limitations are explicit and never turn an untrusted courier into
+> evidence.
 
 Tickets are gathered across the input inventory and identical bytes deduplicated.
 Match RightsId to signed content. For UPD, require the signed content's generation
 and a valid original Nintendo ticket signature; distinct valid tickets remain
-an explicit ambiguity. For BASE/DLC couriers, test each distinct candidate key
-against every referenced rights-bearing NCA's signed hash region and accept only
-one passing key. A bad or misnamed ticket cannot hide a valid candidate. Derived
-recovery key material must also be consistent across the group's members.
+an explicit ambiguity. For BASE/DLC couriers, accept exactly one distinct proven
+key (or one unprobeable key backed by signed NCA recovery). A genuine non-FF
+BASE/DLC ticket is not silently blanked: StandardNSP only defines verbatim
+preservation for Patch/DataPatch, so this unresolved convention case halts for
+review. A bad or misnamed ticket cannot hide a valid candidate.
 
 Ticket titlekey type is checked before any courier decryption. Only common
 (type 0) tickets expose a 16-byte encrypted titlekey. Personalized (type 1)
 tickets carry a console-specific RSA-OAEP block and are never treated as common
 ticket material. When the matching RightsId exists in optional `title.keys`, its
 conventional titlekek-encrypted value is decrypted for the same signed NCA
-generation and must pass every referenced rights-bearing NCA probe before it can
+generation and must pass the shared existential proof set before it can
 regenerate a BASE/DLC public ticket. Without that external entry, conversion is
 reported as unsupported rather than misdiagnosing the wrapped bytes as a corrupt
 titlekey. Unknown titlekey types are likewise unusable. UPD still requires its
@@ -439,7 +458,7 @@ failures. Conflicts return a nonzero exit status; their sources remain in `dropz
 
 Removed: the nstool dependency entirely (final NCA verification — in-house
 RSA + CNMT sha256 under signed Meta cover it; XCI extraction — the in-house
-HFS0 parser; ticket fstree probing — the titlekey probe); the full payload
+HFS0 parser; ticket fstree probing — the bounded titlekey proof set); the full payload
 hash walk and its "requires base NCA" tolerance machinery; terminal
 whole-NSP hashing at publication; repeated Meta re-parsing within a run
 (parse once per group); the standalone split-rejoin utility (intake);

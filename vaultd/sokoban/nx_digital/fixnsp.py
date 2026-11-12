@@ -93,6 +93,12 @@ NCA_HEADER_FIXED_KEY_MODULI = tuple(
 )
 
 TITLE_TYPE_NAMES = {0x80: "BASE", 0x81: "UPD", 0x82: "DLC", 0x84: "UPD"}
+CNMT_FILE_TYPE_NAMES = {
+    0x80: "Application",
+    0x81: "Patch",
+    0x82: "AddOnContent",
+    0x84: "DataPatch",
+}
 NCA_CONTENT_NAMES = {0: "PROGRAM", 1: "META", 2: "CONTROL", 3: "MANUAL",
                      4: "DATA", 5: "PUBLICDATA"}
 TITLE_BEARING_NCA_TYPES = {0, 4, 5}
@@ -722,7 +728,12 @@ def read_nca_header(path: Path, keys: KeySet) -> NcaHeader:
     if len(encrypted) != NCA_HEADER_SIZE:
         raise FixError(f"NCA is smaller than its header: {path.name}")
     raw = bytearray(aes_xts_crypt(encrypted, keys.header_key, decrypt=True))
-    if bytes(raw[0x200:0x204]) not in {b"NCA2", b"NCA3"}:
+    magic = bytes(raw[0x200:0x204])
+    if magic == b"NCA2":
+        raise FixError(
+            f"legacy NCA2 is outside the StandardNSP lane and cannot be "
+            f"authentically converted: {path.name}")
+    if magic != b"NCA3":
         raise FixError(f"failed to decrypt NCA header: {path.name}")
 
     content_type = raw[0x205]
@@ -773,7 +784,7 @@ def read_nca_header(path: Path, keys: KeySet) -> NcaHeader:
 
 
 def write_nca_header(path: Path, raw: bytearray, keys: KeySet) -> None:
-    if len(raw) != NCA_HEADER_SIZE or bytes(raw[0x200:0x204]) not in {b"NCA2", b"NCA3"}:
+    if len(raw) != NCA_HEADER_SIZE or bytes(raw[0x200:0x204]) != b"NCA3":
         raise FixError("refusing to write an invalid decrypted NCA header")
     encrypted = aes_xts_crypt(bytes(raw), keys.header_key, decrypt=False)
     with path.open("r+b") as handle:
@@ -866,48 +877,191 @@ def titlekey_from_ticket(ticket: TicketInfo, header: NcaHeader, keys: KeySet) ->
                        ticket.encrypted_titlekey)
 
 
-def probe_titlekey(header: NcaHeader, plain_titlekey: bytes) -> bool:
-    """The titlekey probe (fixnsp.md step 8): decrypt one hash region with the
-    candidate key and compare against the master hash stored in the signed
-    header. HierarchicalSha256 sections hash their hash table; IVFC sections
-    hash their first level. True only on an exact cryptographic match."""
-    for section in header.sections:
-        if section.crypto_type != 3:
-            continue
-        fs_offset = 0x400 + section.index * 0x200
-        if section.fs_type == 2:
-            master = bytes(header.raw[fs_offset + 0x08:fs_offset + 0x28])
-            hash_offset, hash_size = struct.unpack_from(
-                "<QQ", header.raw, fs_offset + 0x30)
-            if not hash_size or hash_size > 0x400000 or \
-                    hash_offset + hash_size > section.size:
+class TitleKeyProofStatus(str, Enum):
+    PROVEN = "PROVEN"
+    REJECTED = "REJECTED"
+    UNPROVABLE = "UNPROVABLE"
+
+
+@dataclass(frozen=True)
+class TitleKeyProof:
+    status: TitleKeyProofStatus
+    witness: str | None = None
+    attempted: int = 0
+    limitations: tuple[str, ...] = ()
+
+
+TITLEKEY_PROOF_LIMIT = 1 << 22
+SPARSE_NODE_SIZE = 0x4000
+SPARSE_NODE_OFFSET_COUNT = (SPARSE_NODE_SIZE - 0x10) // 8
+SPARSE_NODE_ENTRY_COUNT = (SPARSE_NODE_SIZE - 0x10) // 0x14
+
+
+def decrypt_ctr_region(path: Path, key: bytes, counter: bytes,
+                       offset: int, size: int) -> bytes:
+    if offset < 0 or size < 0:
+        raise FixError("negative AES-CTR proof region")
+    boundary = offset & ~0xF
+    shift = offset - boundary
+    with path.open("rb") as handle:
+        handle.seek(boundary)
+        encrypted = handle.read(shift + size)
+    if len(encrypted) != shift + size:
+        raise FixError(f"titlekey proof extends past EOF: {path.name}")
+    plain = aes_ctr_crypt(encrypted, key, counter, boundary)
+    return plain[shift:shift + size]
+
+
+def hash_ctr_region(path: Path, key: bytes, counter: bytes,
+                    offset: int, size: int, padded_size: int) -> bytes:
+    """Hash a bounded AES-CTR region without loading it as one object."""
+    if offset < 0 or size < 0 or padded_size < size:
+        raise FixError("invalid AES-CTR hash proof region")
+    boundary = offset & ~0xF
+    shift = offset - boundary
+    remaining = shift + size
+    digest = hashlib.sha256()
+    cipher = AES.new(key, AES.MODE_CTR, nonce=counter[:8],
+                     initial_value=boundary // 16)
+    with path.open("rb") as handle:
+        handle.seek(boundary)
+        skip = shift
+        while remaining:
+            wanted = min(remaining, 1024 * 1024)
+            encrypted = handle.read(wanted)
+            if len(encrypted) != wanted:
+                raise FixError(f"titlekey proof extends past EOF: {path.name}")
+            plain = cipher.decrypt(encrypted)
+            if skip:
+                plain = plain[skip:]
+                skip = 0
+            digest.update(plain)
+            remaining -= wanted
+    padding = padded_size - size
+    zeroes = bytes(min(padding, 1024 * 1024))
+    while padding:
+        amount = min(padding, len(zeroes))
+        digest.update(zeroes[:amount])
+        padding -= amount
+    return digest.digest()
+
+
+def sparse_node_opens(node: bytes, entry_count: int) -> bool:
+    if len(node) != SPARSE_NODE_SIZE or entry_count <= 0:
+        return False
+    index, count = struct.unpack_from("<ii", node, 0)
+    end_offset = struct.unpack_from("<q", node, 8)[0]
+    if not 1 <= count <= SPARSE_NODE_OFFSET_COUNT:
+        return False
+    first_offset = struct.unpack_from("<q", node, 0x10)[0]
+    entry_sets = ((entry_count + SPARSE_NODE_ENTRY_COUNT - 1)
+                  // SPARSE_NODE_ENTRY_COUNT)
+    if entry_sets > SPARSE_NODE_OFFSET_COUNT and count < SPARSE_NODE_OFFSET_COUNT:
+        start_offset = struct.unpack_from("<q", node, 0x10 + count * 8)[0]
+    else:
+        start_offset = first_offset
+    return (index == 0 and 0 <= start_offset <= first_offset
+            and start_offset < end_offset)
+
+
+def prove_titlekey(headers: list[NcaHeader], plain_titlekey: bytes) -> TitleKeyProof:
+    """Try every independently readable proof for one RightsId.
+
+    StandardNSP's rule is existential: one hash-level or sparse-table proof is
+    enough. A candidate is rejected only when at least one proof was actually
+    decrypted and none opened; otherwise it is explicitly unprovable.
+    """
+    attempted = 0
+    limitations: list[str] = []
+    for header in headers:
+        for section in header.sections:
+            label = f"{header.path.name} section {section.index}"
+            if section.crypto_type == 1:
                 continue
-            region_offset, region_size = hash_offset, hash_size
-        elif section.fs_type == 3:
-            info = fs_offset + 0x08
-            if bytes(header.raw[info:info + 4]) != IVFC_MAGIC:
+            if section.crypto_type == 4:
+                limitations.append(f"{label}: AES-CTR-EX depends on base content")
                 continue
-            master = bytes(header.raw[info + 0xC0:info + 0xE0])
-            level_offset, level_size = struct.unpack_from(
-                "<QQ", header.raw, info + 0x10)
-            if not level_size or level_size > 0x400000 or \
-                    level_offset + level_size > section.size:
+            if section.crypto_type != 3:
+                limitations.append(
+                    f"{label}: unsupported encryption type {section.crypto_type}")
                 continue
-            region_offset, region_size = level_offset, level_size
-        else:
-            continue
-        aligned_start = region_offset & ~0xF
-        shift = region_offset - aligned_start
-        with header.path.open("rb") as handle:
-            handle.seek(section.offset + aligned_start)
-            encrypted = handle.read(shift + region_size)
-        if len(encrypted) != shift + region_size:
-            continue
-        plain = aes_ctr_crypt(encrypted, plain_titlekey, section.counter,
-                              section.offset + aligned_start)
-        digest = hashlib.sha256(plain[shift:shift + region_size]).digest()
-        return hmac.compare_digest(digest, master)
-    raise FixError(f"no probe-able hash region in {header.path.name}")
+            fs_offset = 0x400 + section.index * 0x200
+            sparse_generation = struct.unpack_from(
+                "<H", header.raw, fs_offset + 0x170)[0]
+            try:
+                if sparse_generation:
+                    entry_count = struct.unpack_from(
+                        "<i", header.raw, fs_offset + 0x160)[0]
+                    bucket_offset = struct.unpack_from(
+                        "<Q", header.raw, fs_offset + 0x148)[0]
+                    bucket_size = struct.unpack_from(
+                        "<Q", header.raw, fs_offset + 0x150)[0]
+                    physical_offset = struct.unpack_from(
+                        "<Q", header.raw, fs_offset + 0x168)[0]
+                    node_offset = physical_offset + bucket_offset
+                    if entry_count == 0:
+                        continue
+                    if (entry_count < 0 or bucket_size < SPARSE_NODE_SIZE
+                            or node_offset + SPARSE_NODE_SIZE > header.path.stat().st_size):
+                        limitations.append(f"{label}: invalid sparse-table bounds")
+                        continue
+                    upper = bytearray(
+                        header.raw[fs_offset + 0x140:fs_offset + 0x148])
+                    upper[:4] = (sparse_generation << 16).to_bytes(4, "little")
+                    counter = bytes((bytes(8) + bytes(upper))[::-1])
+                    node = decrypt_ctr_region(
+                        header.path, plain_titlekey, counter,
+                        node_offset, SPARSE_NODE_SIZE)
+                    attempted += 1
+                    if sparse_node_opens(node, entry_count):
+                        return TitleKeyProof(
+                            TitleKeyProofStatus.PROVEN, f"{label} sparse table",
+                            attempted, tuple(limitations))
+                    continue
+
+                if section.fs_type == 2:
+                    master = bytes(
+                        header.raw[fs_offset + 0x08:fs_offset + 0x28])
+                    region_offset, region_size = struct.unpack_from(
+                        "<QQ", header.raw, fs_offset + 0x30)
+                    padded_size = region_size
+                elif section.fs_type == 3:
+                    if bytes(header.raw[fs_offset + 0x08:
+                                        fs_offset + 0x0C]) != IVFC_MAGIC:
+                        limitations.append(f"{label}: invalid IVFC magic")
+                        continue
+                    master = bytes(
+                        header.raw[fs_offset + 0xC8:fs_offset + 0xE8])
+                    level_offset, level_size, block_order = struct.unpack_from(
+                        "<QQI", header.raw, fs_offset + 0x18)
+                    if block_order >= 64:
+                        limitations.append(f"{label}: invalid IVFC block order")
+                        continue
+                    padded_size = 1 << block_order
+                    region_offset = level_offset
+                    region_size = min(level_size, padded_size)
+                else:
+                    limitations.append(
+                        f"{label}: unsupported hash type {section.fs_type}")
+                    continue
+                if (not region_size or padded_size > TITLEKEY_PROOF_LIMIT
+                        or region_offset + region_size > section.size):
+                    limitations.append(f"{label}: first hash level is not readable")
+                    continue
+                actual = hash_ctr_region(
+                    header.path, plain_titlekey, section.counter,
+                    section.offset + region_offset, region_size, padded_size)
+                attempted += 1
+                if hmac.compare_digest(actual, master):
+                    return TitleKeyProof(
+                        TitleKeyProofStatus.PROVEN, f"{label} first hash level",
+                        attempted, tuple(limitations))
+            except (FixError, OSError, ValueError) as exc:
+                limitations.append(f"{label}: {exc}")
+    status = (TitleKeyProofStatus.REJECTED if attempted
+              else TitleKeyProofStatus.UNPROVABLE)
+    return TitleKeyProof(status, attempted=attempted,
+                         limitations=tuple(dict.fromkeys(limitations)))
 
 
 # --------------------------------------------------------------------------
@@ -1143,29 +1297,60 @@ def write_nca_section(path: Path, section: NcaSection, plain: bytes, key: bytes)
         handle.write(encrypted)
 
 
-def memory_pfs0_first_file(data: bytes) -> tuple[int, int, str]:
+def memory_pfs0_cnmt(data: bytes) -> tuple[int, int, str]:
     if len(data) < 0x10 or data[:4] != PFS0_MAGIC:
         raise FixError("inner Meta NCA data layer is not PFS0")
     count, string_size, reserved = struct.unpack_from("<III", data, 4)
-    if count != 1 or reserved != 0:
-        raise FixError(f"expected one CNMT file inside Meta NCA, found {count}")
+    if reserved != 0:
+        raise FixError("inner PFS0 reserved field is not zero")
     table_end = 0x10 + count * 0x18
     strings_end = table_end + string_size
-    if strings_end > len(data):
+    if table_end > len(data) or strings_end > len(data):
         raise FixError("truncated inner PFS0")
-    offset, size, name_offset, entry_reserved = struct.unpack_from("<QQII", data, 0x10)
-    if entry_reserved or name_offset >= string_size:
-        raise FixError("invalid inner PFS0 entry")
     strings = data[table_end:strings_end]
-    name_end = strings.find(b"\0", name_offset)
-    if name_end < 0:
-        raise FixError("inner PFS0 name is not terminated")
-    name = safe_member_name(strings[name_offset:name_end], 0, "PFS0")
-    start = strings_end + offset
-    end = start + size
-    if end > len(data):
-        raise FixError("inner CNMT extends past Meta NCA data layer")
-    return start, end, name
+    members: list[tuple[int, int, str]] = []
+    ranges: list[tuple[int, int]] = []
+    for index in range(count):
+        offset, size, name_offset, entry_reserved = struct.unpack_from(
+            "<QQII", data, 0x10 + index * 0x18)
+        if entry_reserved or name_offset >= string_size:
+            raise FixError(f"invalid inner PFS0 entry {index}")
+        name_end = strings.find(b"\0", name_offset)
+        if name_end < 0:
+            raise FixError(f"inner PFS0 name {index} is not terminated")
+        name = safe_member_name(strings[name_offset:name_end], index, "PFS0")
+        start = strings_end + offset
+        end = start + size
+        if start < strings_end or end < start or end > len(data):
+            raise FixError(f"inner PFS0 member extends past data layer: {name}")
+        if size:
+            ranges.append((start, end))
+        members.append((start, end, name))
+    ordered = sorted(ranges)
+    if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
+        raise FixError("inner PFS0 members overlap")
+    cnmts = [member for member in members if member[2].lower().endswith(".cnmt")]
+    if len(cnmts) != 1:
+        raise FixError(
+            f"expected exactly one .cnmt member inside Meta NCA, found {len(cnmts)}")
+    return cnmts[0]
+
+
+def validate_cnmt_member_name(name: str, info: CnmtInfo) -> None:
+    match = re.fullmatch(
+        r"(Application|Patch|AddOnContent|DataPatch)_([0-9a-fA-F]{16})\.cnmt",
+        name, re.IGNORECASE)
+    if match is None:
+        raise FixError(f"noncanonical CNMT member name: {name}")
+    expected_type = CNMT_FILE_TYPE_NAMES[info.title_type]
+    if match.group(1).lower() != expected_type.lower():
+        raise FixError(
+            f"CNMT member type/name mismatch: {name} contains {match.group(1)}, "
+            f"payload is {expected_type}")
+    if match.group(2).lower() != info.title_id.lower():
+        raise FixError(
+            f"CNMT member title ID/name mismatch: {name} contains "
+            f"{match.group(2).upper()}, payload is {info.title_id.upper()}")
 
 
 @dataclass(frozen=True)
@@ -1253,15 +1438,18 @@ def read_meta_payload(path: Path, keys: KeySet, *,
     data_end = data_offset + hash_layout.data_size
     if plain[data_offset:data_offset + 4] != PFS0_MAGIC:
         raise FixError(f"Meta NCA data layer is not PFS0: {path.name}")
-    cnmt_start, cnmt_end, cnmt_name = memory_pfs0_first_file(plain[data_offset:data_end])
+    cnmt_start, cnmt_end, cnmt_name = memory_pfs0_cnmt(
+        plain[data_offset:data_end])
     cnmt_start += data_offset
     cnmt_end += data_offset
     payload = plain[cnmt_start:cnmt_end]
+    info = parse_cnmt_payload(payload)
+    validate_cnmt_member_name(cnmt_name, info)
     return MetaPayload(header=header, section=section, section_plain=plain,
                        hash_layout=hash_layout, data_offset=data_offset,
                        cnmt_start=cnmt_start, cnmt_end=cnmt_end,
                        cnmt_name=cnmt_name, payload=payload,
-                       info=parse_cnmt_payload(payload))
+                       info=info)
 
 
 @dataclass(frozen=True)
@@ -1411,6 +1599,110 @@ class NcaArtifact:
     recovery_reason: str | None = None
     origins: tuple[Path, ...] = ()
     recovery_history: tuple[NcaRewrite, ...] = ()
+
+
+def canonicalize_signed_meta_artifact(artifact: NcaArtifact, out_dir: Path,
+                                      keys: KeySet) -> NcaArtifact:
+    """Canonicalize only convention bytes outside Nintendo's signed regions.
+
+    Section geometry lives in the signed header and is therefore rejected,
+    never rewritten. Signature 2, absent fs-header slots and plaintext outside
+    Meta's hash/data regions are not covered by the first signature or Meta
+    hash tree and may be zeroed without inventing signed state.
+    """
+    if artifact.header.content_type != 1:
+        return artifact
+    meta = read_meta_payload(artifact.path, keys)
+    if meta.section.offset != NCA_HEADER_SIZE:
+        raise FixError(
+            f"signed Meta section 0 does not start at 0x{NCA_HEADER_SIZE:X}: "
+            f"{artifact.path.name}")
+    if meta.section.offset + meta.section.size != artifact.path.stat().st_size:
+        raise FixError(
+            f"signed Meta section 0 does not end at NCA EOF: {artifact.path.name}")
+
+    raw = bytearray(meta.header.raw)
+    plain = bytearray(meta.section_plain)
+    changes: list[str] = []
+    if any(raw[0x100:0x200]):
+        raw[0x100:0x200] = bytes(0x100)
+        changes.append("second signature")
+    if any(raw[0x600:0xC00]):
+        raw[0x600:0xC00] = bytes(0x600)
+        changes.append("absent fs-header slots")
+
+    occupied = (
+        (meta.hash_layout.hash_offset,
+         meta.hash_layout.hash_offset + meta.hash_layout.hash_size),
+        (meta.hash_layout.data_offset,
+         meta.hash_layout.data_offset + meta.hash_layout.data_size),
+    )
+    cursor = 0
+    padding_changed = False
+    for start, end in occupied:
+        if any(plain[cursor:start]):
+            plain[cursor:start] = bytes(start - cursor)
+            padding_changed = True
+        cursor = end
+    if any(plain[cursor:]):
+        plain[cursor:] = bytes(len(plain) - cursor)
+        padding_changed = True
+    if padding_changed:
+        changes.append("section padding")
+    if not changes:
+        return artifact
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=".meta-", suffix=".tmp",
+                                     dir=out_dir, delete=False) as handle:
+        temporary = Path(handle.name)
+    try:
+        shutil.copy2(artifact.path, temporary)
+        if padding_changed:
+            write_nca_section(temporary, meta.section, bytes(plain),
+                              nca_section_key(meta.header, keys))
+        write_nca_header(temporary, raw, keys)
+        new_hash = sha256_file(temporary)
+        destination = out_dir / new_hash / f"{new_hash[:32]}.cnmt.nca"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            if sha256_file(destination) != new_hash:
+                raise FixError(
+                    "existing canonical Meta output disagrees with its full hash")
+        else:
+            temporary.rename(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    header = read_nca_header(destination, keys)
+    if not nca_main_signature_valid(header.raw):
+        raise FixError("Meta canonicalization invalidated Nintendo's main signature")
+    validate_signed_nca_header(header)
+    verified = read_meta_payload(destination, keys)
+    if (any(verified.header.raw[0x100:0x200])
+            or any(verified.header.raw[0x600:0xC00])):
+        raise FixError("Meta canonicalization did not produce zero header padding")
+    check_plain = verified.section_plain
+    covered = [False] * len(check_plain)
+    for start, end in occupied:
+        covered[start:end] = [True] * (end - start)
+    if any(value for index, value in enumerate(check_plain) if not covered[index]):
+        raise FixError("Meta canonicalization did not produce zero section padding")
+
+    reason = "standardized Meta " + ", ".join(changes)
+    rewrite = NcaRewrite(
+        source=artifact.path, output=destination,
+        old_hash=artifact.sha256, old_id=artifact.nca_id,
+        new_hash=new_hash, new_id=new_hash[:32])
+    prior_history = artifact.recovery_history or (
+        (artifact.recovery,) if artifact.recovery is not None else ())
+    prior_reason = artifact.recovery_reason
+    combined_reason = "; ".join(
+        item for item in (prior_reason, reason) if item)
+    return NcaArtifact(
+        destination, header, NcaVerification(destination, True),
+        new_hash, new_hash[:32], rewrite, combined_reason,
+        artifact.origins, (*prior_history, rewrite))
 
 
 @dataclass(frozen=True)
@@ -1875,6 +2167,14 @@ def inspect_ncas(scope_path: Path, keys: KeySet,
                     rewrite.new_id, rewrite, reason, (path,), (rewrite,))
                 warnings.append(f"restored signed NCA candidate: {path.name} -> "
                                 f"{rewrite.output.name} ({reason})")
+            if artifact.header.content_type == 1:
+                previous_hash = artifact.sha256
+                artifact = canonicalize_signed_meta_artifact(
+                    artifact, recovery_dir, keys)
+                if artifact.sha256 != previous_hash:
+                    warnings.append(
+                        f"standardized signed Meta NCA: {path.name} -> "
+                        f"{artifact.path.name} ({artifact.recovery_reason})")
             processed[digest] = artifact
             register(artifact)
         except (FixError, OSError, ValueError) as exc:
@@ -1969,9 +2269,11 @@ def discover_groups(source: Path, container_type: str,
 # --------------------------------------------------------------------------
 # the plan
 
-def matching_ticket(group: PackageGroup, rights_id: str,
-                    headers: list[NcaHeader], keys: KeySet) -> TicketInfo | None:
-    """Select by signed content requirements, never ticket path or ordering."""
+def matching_update_ticket(
+        group: PackageGroup, rights_id: str,
+        headers: list[NcaHeader], keys: KeySet
+        ) -> tuple[TicketInfo | None, TitleKeyProof | None]:
+    """Select a genuine update ticket by RightsId, signature and key proof."""
     relevant = [h for h in headers if h.rights_id == rights_id]
     generations = {h.key_generation for h in relevant}
     if len(generations) != 1:
@@ -1980,31 +2282,43 @@ def matching_ticket(group: PackageGroup, rights_id: str,
     matches = [ticket for ticket in group.tickets
                if ticket.rights_id.lower() == rights_id.lower()]
     if not matches:
-        return None
-    accepted: dict[bytes, TicketInfo] = {}
-    unsupported: set[str] = set()
+        return None, None
+    accepted: dict[bytes, tuple[TicketInfo, TitleKeyProof]] = {}
+    rejected: set[str] = set()
     for ticket in matches:
         if failure := ticket_titlekey_failure(ticket):
-            unsupported.add(failure)
+            rejected.add(failure)
             continue
-        if group.meta.info.type_name == "UPD":
-            if update_ticket_failure(ticket) is None and ticket.key_generation == generation:
-                accepted.setdefault(ticket.path.read_bytes(), ticket)
-        else:
-            # Courier metadata can be damaged. Only the key's decrypt probe
-            # against every referenced signed rights-bearing header decides.
-            try:
-                plain = ecb_decrypt(keys.titlekek(max(generation - 1, 0)),
-                                    ticket.encrypted_titlekey)
-                if all(probe_titlekey(header, plain) for header in relevant):
-                    accepted.setdefault(ticket.encrypted_titlekey, ticket)
-            except (FixError, ValueError, OSError):
-                continue
+        if ticket.signature_class == "FF":
+            rejected.add("FF/fake-signed ticket")
+            continue
+        if not ticket.signature_valid:
+            rejected.add("Nintendo RSA signature invalid")
+            continue
+        if ticket.key_generation != generation:
+            rejected.add(
+                f"ticket generation {ticket.key_generation} does not match signed "
+                f"NCA generation {generation}")
+            continue
+        try:
+            plain = ecb_decrypt(keys.titlekek(max(generation - 1, 0)),
+                                ticket.encrypted_titlekey)
+            proof = prove_titlekey(relevant, plain)
+        except (FixError, ValueError, OSError) as exc:
+            rejected.add(str(exc))
+            continue
+        if proof.status == TitleKeyProofStatus.REJECTED:
+            rejected.add("titlekey failed every readable signed-NCA proof")
+            continue
+        accepted.setdefault(ticket.path.read_bytes(), (ticket, proof))
     if not accepted:
-        detail = ("; " + "; ".join(sorted(unsupported))) if unsupported else ""
-        raise FixError("no matching ticket passes the signed content requirements" + detail)
+        detail = ("; " + "; ".join(sorted(rejected))) if rejected else ""
+        raise FixError(
+            "no matching update ticket passes the signed content requirements"
+            + detail)
     if len(accepted) != 1:
-        raise FixError(f"multiple distinct valid tickets/keys for RightsId {rights_id}")
+        raise FixError(
+            f"multiple distinct valid update tickets for RightsId {rights_id}")
     return next(iter(accepted.values()))
 
 
@@ -2149,68 +2463,145 @@ def build_repair_plan(group: PackageGroup, group_work: Path, keys: KeySet,
         plan.failures.append("matching rights-bearing NCAs disagree on key generation: "
                              f"{rights_generations}")
     ticket_generation = rights_generations[0] if len(rights_generations) == 1 else None
-    materials = {rewrite.encrypted_titlekey for item in plan.content
-                 for rewrite in (item.source.recovery_history or
-                                 ((item.rewrite,) if item.rewrite else ()))
-                 if rewrite.encrypted_titlekey is not None}
-    if len(materials) > 1:
-        raise FixError("recovered content disagrees on encrypted titlekey")
-    ticket_material = next(iter(materials), None)
-    has_personalized_ticket = bool(rights_id) and any(
-        ticket.rights_id.lower() == rights_id.lower() and ticket.titlekey_type == 1
-        for ticket in group.tickets)
-    if (rights_id and ticket_generation is not None and has_personalized_ticket
-            and title_keys is not None and rights_id.lower() in title_keys.values):
-        external = title_keys.values[rights_id.lower()]
-        try:
-            plain = ecb_decrypt(keys.titlekek(max(ticket_generation - 1, 0)), external)
-            relevant = [header for header in output_headers
-                        if header.rights_id == rights_id]
-            if relevant and all(probe_titlekey(header, plain) for header in relevant):
-                if ticket_material is not None and ticket_material != external:
-                    raise FixError("recovered content and title.keys disagree on titlekey")
-                ticket_material = external
-            elif info.type_name in {"BASE", "DLC"} and ticket_material is None:
-                raise FixError(
-                    f"title.keys entry for RightsId {rights_id} fails the signed NCA probe")
-        except (ValueError, OSError) as exc:
-            raise FixError(f"invalid title.keys entry for RightsId {rights_id}") from exc
-    existing_ticket = None
-    if rights_id and (info.type_name == "UPD" or ticket_material is None):
-        existing_ticket = matching_ticket(group, rights_id, output_headers, keys)
     ticket_dir = group_work / "ticket"
 
     if rights_id and ticket_generation is None:
         plan.failures.append("title-rights content has no unambiguous NCA key generation")
     elif rights_id and info.type_name in {"BASE", "DLC"}:
-        encrypted_titlekey = ticket_material or (
-            existing_ticket.encrypted_titlekey if existing_ticket else None)
-        if encrypted_titlekey is None:
+        relevant = [header for header in output_headers
+                    if header.rights_id == rights_id]
+        matching_tickets = [ticket for ticket in group.tickets
+                            if ticket.rights_id.lower() == rights_id.lower()]
+        genuine = [ticket for ticket in matching_tickets
+                   if ticket.signature_class == "NONFF" and ticket.signature_valid]
+        accepted: dict[bytes, set[str]] = {}
+        rejected_sources: set[str] = set()
+
+        if genuine:
             plan.failures.append(
-                f"{info.type_name} title-rights content has no recoverable ticket/titlekey")
+                f"{info.type_name} has a genuine non-FF ticket; StandardNSP only "
+                "defines preservation of genuine tickets for Patch/DataPatch, so "
+                "automatic conversion would discard signed evidence")
         else:
-            ticket_dir.mkdir(parents=True, exist_ok=True)
-            plan.ticket_path = ticket_dir / f"{rights_id}.tik"
-            generated = make_public_ticket(rights_id, encrypted_titlekey,
-                                           ticket_generation)
-            plan.ticket_path.write_bytes(generated)
-            if existing_ticket is None or \
-                    existing_ticket.path.read_bytes() != generated:
-                outcomes.append(Outcome.RESTORED)
-                if existing_ticket is not None and \
-                        existing_ticket.key_generation != ticket_generation:
+            recovered_materials = {
+                rewrite.encrypted_titlekey
+                for item in plan.content
+                for rewrite in (item.source.recovery_history or
+                                ((item.rewrite,) if item.rewrite else ()))
+                if rewrite.encrypted_titlekey is not None
+            }
+            for material in recovered_materials:
+                try:
+                    plain = ecb_decrypt(
+                        keys.titlekek(max(ticket_generation - 1, 0)), material)
+                    proof = prove_titlekey(relevant, plain)
+                except (FixError, ValueError, OSError) as exc:
+                    rejected_sources.add(f"signed recovery material: {exc}")
+                    continue
+                if proof.status == TitleKeyProofStatus.REJECTED:
+                    rejected_sources.add(
+                        "signed recovery material failed every readable proof")
+                    continue
+                accepted.setdefault(material, set()).add("signed NCA recovery")
+                if proof.status == TitleKeyProofStatus.UNPROVABLE:
                     plan.warnings.append(
-                        "ticket generation repaired from "
-                        f"{existing_ticket.key_generation} to signed NCA "
+                        "signed NCA recovery supplied the titlekey, but this "
+                        "RightsId has no independently readable titlekey proof")
+
+            for ticket in matching_tickets:
+                if failure := ticket_titlekey_failure(ticket):
+                    rejected_sources.add(f"input ticket: {failure}")
+                    continue
+                try:
+                    plain = ecb_decrypt(
+                        keys.titlekek(max(ticket_generation - 1, 0)),
+                        ticket.encrypted_titlekey)
+                    proof = prove_titlekey(relevant, plain)
+                except (FixError, ValueError, OSError) as exc:
+                    rejected_sources.add(f"input ticket: {exc}")
+                    continue
+                if proof.status == TitleKeyProofStatus.PROVEN:
+                    accepted.setdefault(ticket.encrypted_titlekey, set()).add(
+                        "input ticket")
+                else:
+                    rejected_sources.add(
+                        "input ticket titlekey "
+                        + ("failed every readable proof"
+                           if proof.status == TitleKeyProofStatus.REJECTED
+                           else "has no independently readable proof"))
+
+            has_personalized_ticket = any(
+                ticket.titlekey_type == 1 for ticket in matching_tickets)
+            if (has_personalized_ticket and title_keys is not None
+                    and rights_id.lower() in title_keys.values):
+                external = title_keys.values[rights_id.lower()]
+                try:
+                    plain = ecb_decrypt(
+                        keys.titlekek(max(ticket_generation - 1, 0)), external)
+                    proof = prove_titlekey(relevant, plain)
+                except (FixError, ValueError, OSError) as exc:
+                    rejected_sources.add(f"title.keys: {exc}")
+                else:
+                    if proof.status == TitleKeyProofStatus.PROVEN:
+                        accepted.setdefault(external, set()).add("title.keys")
+                    else:
+                        rejected_sources.add(
+                            "title.keys entry "
+                            + ("failed every readable proof"
+                               if proof.status == TitleKeyProofStatus.REJECTED
+                               else "has no independently readable proof"))
+
+            if len(accepted) > 1:
+                plan.failures.append(
+                    f"multiple distinct proven titlekeys for RightsId {rights_id}")
+            elif not accepted:
+                detail = ("; " + "; ".join(sorted(rejected_sources))
+                          if rejected_sources else "")
+                plan.failures.append(
+                    f"{info.type_name} title-rights content has no acceptable "
+                    f"ticket/titlekey{detail}")
+            else:
+                encrypted_titlekey = next(iter(accepted))
+                ticket_dir.mkdir(parents=True, exist_ok=True)
+                plan.ticket_path = ticket_dir / f"{rights_id}.tik"
+                generated = make_public_ticket(
+                    rights_id, encrypted_titlekey, ticket_generation)
+                plan.ticket_path.write_bytes(generated)
+                existing_bytes = {
+                    ticket.path.read_bytes() for ticket in matching_tickets}
+                if generated not in existing_bytes:
+                    outcomes.append(Outcome.RESTORED)
+                repaired_generations = sorted({
+                    ticket.key_generation for ticket in matching_tickets
+                    if ticket.encrypted_titlekey == encrypted_titlekey
+                    and ticket.key_generation != ticket_generation
+                })
+                if repaired_generations:
+                    shown = ", ".join(map(str, repaired_generations))
+                    plan.warnings.append(
+                        f"ticket generation repaired from {shown} to signed NCA "
                         f"generation {ticket_generation}")
     elif rights_id and info.type_name == "UPD":
-        ticket_failure = update_ticket_failure(existing_ticket)
-        if ticket_failure is not None:
-            plan.failures.append(ticket_failure)
+        selection_failed = False
+        try:
+            existing_ticket, proof = matching_update_ticket(
+                group, rights_id, output_headers, keys)
+        except FixError as exc:
+            plan.failures.append(str(exc))
+            existing_ticket, proof = None, None
+            selection_failed = True
+        if existing_ticket is None and not selection_failed:
+            ticket_failure = update_ticket_failure(None)
+            if ticket_failure is not None:
+                plan.failures.append(ticket_failure)
         elif existing_ticket is not None:
             ticket_dir.mkdir(parents=True, exist_ok=True)
             plan.ticket_path = ticket_dir / f"{rights_id}.tik"
             shutil.copy2(existing_ticket.path, plan.ticket_path)
+            if proof is not None and proof.status == TitleKeyProofStatus.UNPROVABLE:
+                plan.warnings.append(
+                    "original UPD ticket accepted by Nintendo RSA signature; this "
+                    "RightsId has no independently readable titlekey proof")
     elif group.tickets:
         plan.warnings.append(
             "orphan ticket omitted because no output NCA uses title rights")
@@ -2307,7 +2698,7 @@ def verify_packed_output(path: Path, names: list[str], sizes: list[int],
                 if len(encrypted) != NCA_HEADER_SIZE:
                     raise FixError(f"post-build NCA header truncated: {entry.name}")
                 raw = aes_xts_crypt(encrypted, keys.header_key, decrypt=True)
-                if (raw[0x200:0x204] not in {b"NCA2", b"NCA3"}
+                if (raw[0x200:0x204] != b"NCA3"
                         or not nca_main_signature_valid(raw)):
                     raise FixError(f"post-build NCA header/signature invalid: {entry.name}")
                 if struct.unpack_from("<Q", raw, 0x208)[0] != entry.size:
@@ -2429,9 +2820,11 @@ def print_finding(message: str, *, indent: str = "  ") -> None:
     if is_inventory_repair_message(message):
         return
     lowered = message.lower()
-    if "type-6 delta fragment" in lowered or "orphan ticket" in lowered:
+    if ("type-6 delta fragment" in lowered or "orphan ticket" in lowered
+            or "no independently readable titlekey proof" in lowered):
         label = "notice"
-    elif "ticket generation repaired" in lowered:
+    elif ("ticket generation repaired" in lowered
+          or message.startswith("standardized signed Meta NCA:")):
         label = "repair"
     else:
         label = "warning"
