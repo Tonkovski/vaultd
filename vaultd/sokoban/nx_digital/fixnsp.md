@@ -40,17 +40,40 @@ card capacity exceeds EOF is bounds-checked, not rejected; an XCI's firmware
 `update` partition is ignored. XCI is only a container source: admission is
 decided from the referenced NCA headers, never the input extension.
 
-## Step 2 — Group discovery
+A root HFS0 partition may declare unused trailing bytes beyond physical EOF.
+Accept this only after its nested HFS0 table, every declared member extent and
+all hashed regions are verified within the real file. Keep nested/leaf bounds
+strict: never shorten an NCA or synthesize missing bytes. Validate all selected
+partitions before touching extraction output, and report the omitted tail size.
+This also checks a trimmed ignored partition before treating its tail as padding.
 
-Every readable Meta/CNMT NCA is one independent repair attempt producing at
-most one normalized NSP. A malformed group never blocks other groups in the
-same container. Unreadable, duplicate, and unreferenced files are reported
-and left unused. An identifiable Meta that cannot be read is a failed group,
-never downgraded to an unused-wrapper warning.
+> Lesson (`010051F0207B2000`): the root `secure` extent exceeds EOF by 512 bytes,
+> but its final Meta NCA ends exactly at EOF and every HFS0 prefix hash verifies.
+> The XCI header's valid-data end agrees with EOF; rejecting the root extent alone
+> incorrectly rejected complete game content.
 
-Inspect content NCAs before attempting Meta recovery, independent of wrapper
-filename order. A Meta can require hashes from those signed content recoveries
-before its own signature can be restored.
+## Step 2 — One input inventory, two recovery passes, then grouping
+
+NSP, NSZ, XCI and XCZ all use the same workflow after unpacking. An inventory
+belongs to exactly one input container. XCI `secure` and `normal` content
+participate together; firmware `update` is excluded. Retain original paths,
+partition provenance, tickets and certificates. Never borrow from another input.
+
+Hash and inspect each NCA, then run signature-based best-effort recovery on all
+content NCAs before attempting any Meta NCA. Recovery is independent of wrapper
+names, including apparently correct hash names. Identical input bytes are repaired
+once. Index resulting candidates by full SHA-256, deduplicate identical results,
+and retain their origins and recovery histories. Distinct full hashes stay
+separate even if their short IDs or release identities coincide.
+
+Each unique signed Meta/CNMT selects its members from that shared inventory by
+actual ID, full SHA-256 and exact size. Complementary partitions may supply one
+group; several CNMTs may reference the same NCA object. No per-group staging
+copies are needed. Original names remain diagnostic labels; canonical member
+names are generated only when writing the output NSP. A malformed or incomplete
+group does not block unrelated complete groups. An unrecoverable identifiable
+Meta remains a failed attempt. Unreferenced signed candidates are reported,
+never guessed into a group. Grouping and publication do not rerun recovery.
 
 ## Step 3 — Meta parsing under declared geometry
 
@@ -105,16 +128,23 @@ The old linear ladder tested transforms in isolation and could not reach
 composed mutilations (de-rights'd AND downgraded AND flag-flipped); the
 enumeration reaches every point of the space.
 
-**Best effort, defined**: every signature-failing NCA goes through the full
-enumeration — no lane keeps a linear remnant. Two lanes differ only in
-oracle strength, never in coverage: a *noncanonical* NCA (hash disagrees
-with its CNMT-declared id) demands signature AND expected-id; a
-*hash-consistent* NCA (its bytes are its name, yet unsigned) has no
-expected id to hit, and the signature alone decides — sufficient, because
-at most one candidate can ever verify. An NCA leaves the fix either
-Nintendo-signature-valid or honestly IMPOSSIBLE; when content restorations
-change ids, the rebuilt Meta must regain Nintendo's signature, confirming
-the whole group reconstruction end-to-end.
+Distribution restoration composes with every rightsless generation/key-area
+candidate, in both directions (Download/GameCard). Keep the unchanged header
+as a candidate for Meta-only repair and deduplicate candidates by their full
+header bytes. Rights restoration remains restricted to the digital lane.
+
+> Lesson (`0100AC400CD82000`): the implementation previously tried a standalone
+> distribution flip and separate generation inverses, missing their combination.
+> Combining GameCard distribution with generation 8 restores the sample's Control
+> and Manual signatures. Recovery failures must report signature/identity failure
+> or the actual recovery exception, rather than presenting them as mere bad names.
+
+**Best effort, defined**: every signature-failing NCA uses one supported
+signature-driven enumeration before grouping. There is no expected-filename-ID
+lane and no second fallback pass. A successful candidate receives its actual
+hash-derived ID. A restored header is not proof of its body: publication still
+requires a valid signed local CNMT referencing the exact ID, full hash and size.
+Partial recoveries are reported without calling the entire package repaired.
 
 Direction law: the title-rights reversal runs forward only (key area →
 ticket). The inverse — stuffing a ticket key into the key area — is the
@@ -138,10 +168,11 @@ parameter is out of scope by definition.
 
 ## Step 6 — Meta rebuild and CNMT scalars
 
-If any content was rewritten: patch the CNMT in place (refuse to resize),
-recompute per-block hashes over the same declared geometry, then master
-hash, then section-header digest; re-encrypt; the rebuilt Meta must regain
-Nintendo's signature or the group fails.
+During the second recovery pass, a signature-failing Meta may use exact
+content recoveries from anywhere in this input. Propose CNMT changes in place
+(refuse to resize), recompute hashes under the declared geometry, and require
+the Meta's Nintendo signature to return. Already-signed Meta bytes are preserved;
+no post-group metadata rewrite is performed.
 
 `RequiredSystemVersion` / `RequiredApplicationVersion` (CNMT extended
 header — protected transitively by the Meta signature; tampering is detected
@@ -157,14 +188,14 @@ candidate costs one small-Meta rebuild plus one RSA verify. No candidate source
 Meta/CNMT always remains the authoritative metadata source; DB values never
 change acceptance or naming on their own.
 
-Some downgrades keep original CNMT content IDs but overwrite the full hashes
-with hashes of the modified NCAs. A full hash can be restored when the referenced
-NCA has already regained its Nintendo signature and exact original ID, the
-CNMT hash equals that recovery's recorded input hash, and the declared size
-matches. This hash repair composes with header and scalar restoration in both
-Meta recovery lanes. Other CNMT bytes, including its trailing digest, stay as
-supplied. The resulting Meta must regain its own signature; the noncanonical
-lane must also regain the expected filename ID. Failed proofs stay rejected.
+Some repacks overwrite CNMT hashes and/or IDs with those of modified NCAs.
+A candidate correction requires an exact match between the CNMT's full hash
+and a recovery's recorded input hash (or an intact signed candidate's actual
+hash for an ID-only correction), equal size, and one unambiguous signed candidate. Propose that candidate's actual full hash and ID together.
+All retained recovery histories participate, even when several modified inputs
+converge on identical recovered bytes. This composes with header and scalar
+restoration; only the Meta signature approves the result. Other CNMT bytes,
+including its trailing digest, remain as supplied.
 
 > Lesson (Monument Valley 3): restoring generation 18 alone was insufficient.
 > Three CNMT hashes described the damaged content and requiredSystemVersion was
@@ -226,6 +257,25 @@ byte-reproducible because the common ticket is identical on every card.
 > the ticket signature is the stronger proof); the probe preserves that
 > firewall with none of the plumbing.
 
+Tickets are gathered across the input inventory and identical bytes deduplicated.
+Match RightsId to signed content. For UPD, require the signed content's generation
+and a valid original Nintendo ticket signature; distinct valid tickets remain
+an explicit ambiguity. For BASE/DLC couriers, test each distinct candidate key
+against every referenced rights-bearing NCA's signed hash region and accept only
+one passing key. A bad or misnamed ticket cannot hide a valid candidate. Derived
+recovery key material must also be consistent across the group's members.
+
+Ticket titlekey type is checked before any courier decryption. Only common
+(type 0) tickets expose a 16-byte encrypted titlekey. Personalized (type 1)
+tickets carry a console-specific RSA-OAEP block; fixnsp does not implement its
+unwrapping and must report that unsupported conversion explicitly, not diagnose
+the wrapped bytes as a corrupt titlekey. Unknown titlekey types are likewise
+unusable. Unsupported candidates cannot hide a usable common ticket, and
+independently recovered key material can still produce a BASE/DLC public ticket.
+UPD still requires its original signed common ticket. Final output tickets must
+also be common. The parser rejects unsupported signature layouts rather than
+interpreting their bytes at RSA-2048/SHA-256 offsets.
+
 ## Step 9 — GAMECARD groups
 
 nxdumptool dumps titles from any NCM storage; an inserted card is storage.
@@ -267,11 +317,22 @@ PFS0 to the nxdumptool convention (confirmed in both codebases —
 content-record order, then Meta (`.cnmt.nca`), then `.tik`, then `.cert`;
 string table padded so the full header (0x10 + 0x18·entries + names) aligns
 to 0x20, **with a full extra 0x20 block when already aligned**; no duplicate
-names; contiguous offsets. Post-build, the engine re-reads its own output's
-PFS0 table and confirms order and names — audit your own product.
+names; contiguous offsets. While packing, hash each copied member against
+its approved full SHA-256 and require the declared byte count exactly. This
+uses the existing copy pass and catches files changed since inspection.
+Read back the candidate's table, sizes, every NCA header/signature, and the
+complete Meta/ticket/certificate hashes. Repeat this bounded readback on the
+publication temporary file before its atomic rename; a failure leaves any
+existing destination intact. Large content bodies get no extra readback pass.
 Publication is atomic; a source container is archived only when every
 discovered group in it succeeded; failures leave the source in place. No
 terminal hash ceremony: ingest measures the product at enrollment.
+
+Distinct signed Meta variants with the same TID/version/type remain separate.
+Their outputs go to `fixnsp-variants/<full-Meta-SHA256>/` under the output directory,
+using the normal NSP filename inside. This keeps them outside automatic ingest
+until the operator chooses their labels; `--overwrite` cannot replace a sibling
+variant. Single-variant releases continue publishing directly to the output root.
 
 > Lessons: Lydie — content order follows raw CNMT order, not type-sorted
 > order. Rain World / Calculator — string tables of 0xB0, 0x100, 0x128 all
@@ -301,7 +362,7 @@ rejection marker. Startup reports the number of excluded rows.
 Normal hashdb admission also requires a clean matching ROM filename containing
 the input CNMT's exact `[TID]` token, case-insensitively. Other clean claimants
 are reported but cannot authorize admission. If none has the TID, the source
-stays in the dropzone as a conflict. Updates use their own TID, not the base
+moves to `dropzone/conflict/` for manual resolution. Updates use their own TID, not the base
 entity ID. Input filenames must have one unambiguous TID/version/type and
 at most one provenance marker; the CNMT must agree with that identity.
 
@@ -317,7 +378,7 @@ The clean DAT ROM filenames also index recorded NSP hashes by `[TID][vN]`:
 - **Enrollment conflict:** the admitted incoming artifact collides with an
   enrolled release and marker. Different comparable bytes and an unverified
   NSP/NSZ overlap both report `CONFLICT`, with the specific reason in the log.
-  Retain the source in the dropzone root for manual resolution. An overlap
+  Move the source to `dropzone/conflict/` for manual resolution. An overlap
   does not assert different content or a database mismatch; no compression
   or decompression of the enrolled copy is attempted.
 
@@ -329,7 +390,7 @@ are allowed. These checks retain the existing exact-TID rule, without adding
 content re-verification. The verified `[GAMECARD]` lane keeps its no-positive-
 match rule because card bytes can differ from the digital release.
 
-Quarantine and label-duplicate moves preserve existing
+Conflict, quarantine and label-duplicate moves preserve existing
 same-named files by choosing a numbered filename. Exact duplicates are
 removed only after checking the enrolled file's presence/size and agreement
 between XML and checksum metadata. `--copy` retains sources on success and
@@ -365,7 +426,7 @@ Malformed containers and per-item I/O failures are logged and counted without
 aborting unrelated candidates. An unfinished checkpoint stops the batch to
 preserve ordering. The final digest separates real quarantine, `UNDECIDED`
 for missing clean hashdb evidence, conflicts (including format overlaps), and
-failures. Conflicts return a nonzero exit status; their sources remain in place.
+failures. Conflicts return a nonzero exit status; their sources remain in `dropzone/conflict/`.
 
 ## Duplications eliminated (and what is kept deliberately)
 

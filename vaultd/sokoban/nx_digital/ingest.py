@@ -1,10 +1,10 @@
 """NX digital keeper: ingest NSP/NSZ artifacts from the workspace dropzone.
 
 Intake scans ONLY the dropzone root — keeper sub-areas (fixnsp*/, duplicate/,
-quarantine/, ...) are invisible to it. Clean DAT TID/version hash mismatches
+quarantine/, conflict/, ...) are invisible to it. Clean DAT TID/version hash mismatches
 move to dropzone/quarantine/; label-priority losers to dropzone/duplicate/.
-Conflicts, including unverified NSP/NSZ overlaps, stay in the dropzone for
-manual resolution. Byte-duplicates of enrolled artifacts are DELETED. An unknown hash whose TID/version is also absent from
+Conflicts, including unverified NSP/NSZ overlaps, move to dropzone/conflict/
+for manual resolution. Byte-duplicates of enrolled artifacts are DELETED. An unknown hash whose TID/version is also absent from
 the clean hashdb stays in the dropzone awaiting a fresher dat or --force LABEL.
 Bad-ticket, hacked and bad-dump DAT rows are absent from both lookup indexes.
 
@@ -21,7 +21,7 @@ Storage lanes:
   * --force LABEL       -> bypass hashdb; bare NSP as [..][TYPE][LABEL].nsp
 Admission priority for one (entity, version): vanilla > [GAMECARD] > [custom
 label]; distinct customs coexist; the same marker with different bytes is a
-conflict (left in place, resolve by hand). If that marker is already stored
+conflict (moved to conflict/, resolve by hand). If that marker is already stored
 as NSZ, the incoming NSP form cannot be compared directly: report a conflict
 and retain the input without compressing it or unpacking the enrolled NSZ.
 Incoming NSZ bytes can be compared directly with the recorded NSZ hash.
@@ -185,7 +185,7 @@ def admission_marker(subject_sha1: str, gate: HashDB,
     matching = [name for name in clean if rom_matches_tid(name, title_id)]
     if not matching:
         raise Skip("conflict", f"SHA-1 matches hashdb, but no ROM filename contains "
-                   f"[{title_id.upper()}]; source retained:\n"
+                   f"[{title_id.upper()}]; manual resolution required:\n"
                    + "\n".join(f"        - {name}" for name in clean))
     ignored = [name for name in clean if name not in matching]
     if ignored:
@@ -472,12 +472,12 @@ def ingest_one(source: Path, work_root: Path, root: ET.Element,
                        f"version {ver} already enrolled under '{marker or 'vanilla'}' "
                        f"as NSZ: {', '.join(sorted(enrolled_nsz))}; "
                        "NSP and NSZ hashes are not comparable; content equivalence "
-                       "unverified, compression skipped; source retained for manual resolution")
+                       "unverified, compression skipped; manual resolution required")
         if marker in enrolled_markers:
             raise Skip("conflict",
                        f"version {ver} already enrolled under "
                        f"'{marker or 'vanilla'}' with different stored bytes; "
-                       "source retained for manual resolution")
+                       "manual resolution required")
 
     # --- storage lane and destination gate (before compression) ---
     if marker in {"", "GAMECARD"}:
@@ -562,7 +562,8 @@ def route_skip(source: Path, skip: Skip, *, keep_source: bool) -> None:
             source.unlink()
         print("  source retained (--copy)" if keep_source else "  duplicate source removed")
         return
-    areas = {"labeldup": "duplicate", "quarantined": "quarantine"}
+    areas = {"labeldup": "duplicate", "quarantined": "quarantine",
+             "conflict": "conflict"}
     if skip.verdict not in areas:
         return
     target_dir = DROPZONE / areas[skip.verdict]
