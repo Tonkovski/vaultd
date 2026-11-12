@@ -2400,19 +2400,116 @@ def group_output_dir(out_dir: Path, group: PackageGroup,
     return out_dir
 
 
-def print_plan(plan: RepairPlan) -> None:
+def display_outcome(outcome: Outcome) -> str:
+    return {
+        Outcome.PRESERVE: "PRESERVED",
+        Outcome.RESTORED: "RESTORED",
+        Outcome.IMPOSSIBLE: "REJECTED",
+    }[outcome]
+
+
+def display_repair_reason(reason: str) -> str:
+    match = re.fullmatch(
+        r"title-rights and crypto-generation restoration (\d+) -> (\d+) "
+        r"\(RightsId title ([0-9a-fA-F]{16})\)", reason)
+    if match is None:
+        return reason
+    previous, current, title_id = match.groups()
+    generation = (f"key generation unchanged at {current}"
+                  if previous == current
+                  else f"key generation {previous} -> {current}")
+    return f"restored title rights for {title_id.upper()}; {generation}"
+
+
+def is_inventory_repair_message(message: str) -> bool:
+    return message.startswith("restored signed NCA candidate:")
+
+
+def print_finding(message: str, *, indent: str = "  ") -> None:
+    if is_inventory_repair_message(message):
+        return
+    lowered = message.lower()
+    if "type-6 delta fragment" in lowered or "orphan ticket" in lowered:
+        label = "notice"
+    elif "ticket generation repaired" in lowered:
+        label = "repair"
+    else:
+        label = "warning"
+    print(f"{indent}{label:<9} {message}")
+
+
+def decision_rights_id(decision: NcaDecision) -> str | None:
+    if decision.rewrite is not None and decision.rewrite.rights_id:
+        return decision.rewrite.rights_id.lower()
+    return decision.source.header.rights_id
+
+
+def rejected_ticket_reason(ticket: TicketInfo) -> str:
+    if failure := ticket_titlekey_failure(ticket):
+        return failure
+    if ticket.signature_class == "FF":
+        return "FF/fake-signed ticket"
+    if not ticket.signature_valid:
+        return "Nintendo RSA signature invalid"
+    return "titlekey failed the signed NCA decrypt probe"
+
+
+def print_ticket_status(plan: RepairPlan) -> None:
     info = plan.group.meta.info
-    print(f"  group:   {info.title_id.upper()} v{info.version} {info.type_name}"
-          f"{' [GAMECARD]' if plan.gamecard_variant else ''}")
-    for decision in plan.content + ([plan.meta] if plan.meta else []):
-        print(f"    {decision.outcome.value:<10} {decision.output.name}: {decision.reason}")
     if plan.ticket_path is not None:
-        print(f"    TICKET     {plan.ticket_path.name}")
+        action = ("preserved original signed common ticket"
+                  if info.type_name == "UPD"
+                  else "generated standardized common ticket")
+        print(f"    ticket    {action}: {plan.ticket_path.name}")
+        return
+
+    missing_update_ticket = any(
+        failure == "UPD title-rights content has no matching original ticket"
+        for failure in plan.failures)
+    if not missing_update_ticket:
+        return
+
+    rights_ids = sorted({rights_id for decision in plan.content
+                         if (rights_id := decision_rights_id(decision))})
+    if len(rights_ids) != 1:
+        print("    ticket    no unambiguous content RightsId")
+        return
+    rights_id = rights_ids[0]
+    matches = [ticket for ticket in plan.group.tickets
+               if ticket.rights_id.lower() == rights_id]
+    if not plan.group.tickets:
+        print(f"    ticket    no input ticket found for RightsId {rights_id.upper()}")
+    elif not matches:
+        count = len(plan.group.tickets)
+        print(f"    ticket    {count} input ticket(s); none match RightsId "
+              f"{rights_id.upper()}")
+    else:
+        reasons = sorted({rejected_ticket_reason(ticket) for ticket in matches})
+        print(f"    ticket    {len(matches)} matching ticket(s) rejected: "
+              f"{'; '.join(reasons)}")
+
+
+def print_plan(plan: RepairPlan) -> None:
+    decisions = plan.content + ([plan.meta] if plan.meta else [])
+    signed = sum(item.verification.main_signature_valid for item in decisions)
+    repaired = [item for item in decisions if item.outcome == Outcome.RESTORED]
+    if signed == len(decisions):
+        signature_status = "all Nintendo signatures valid"
+    else:
+        signature_status = f"{signed}/{len(decisions)} Nintendo signatures valid"
+    print(f"    ncas      {len(plan.content)} content + "
+          f"{1 if plan.meta else 0} Meta; {signature_status}; "
+          f"{len(repaired)} repaired")
+    if plan.gamecard_variant:
+        print("    variant   GAMECARD")
+    for decision in repaired:
+        print(f"    repair    {decision.output.name}: "
+              f"{display_repair_reason(decision.reason)}")
+    print_ticket_status(plan)
     for warning in plan.warnings:
-        print(f"  WARNING: {warning}")
+        print_finding(warning, indent="    ")
     for failure in plan.failures:
-        print(f"  FAIL:    {failure}")
-    print(f"  outcome: {plan.outcome.value}")
+        print(f"    error     {failure}")
 
 
 # --------------------------------------------------------------------------
@@ -2456,7 +2553,7 @@ def main(argv: list[str] | None = None) -> int:
     configure_utf8_stdio()
     args = parse_args(argv)
     if not args.keys.exists():
-        print(f"FAIL: prod.keys not found: {args.keys}", file=sys.stderr)
+        print(f"error     prod.keys not found: {args.keys}", file=sys.stderr)
         return 2
     inputs = list(args.input) if args.input else discover_inputs(args.intake)
     if not inputs:
@@ -2465,7 +2562,7 @@ def main(argv: list[str] | None = None) -> int:
 
     protected_sources = tuple((source.resolve(), source.is_dir()) for source in inputs)
     if len({path for path, _ in protected_sources}) != len(protected_sources):
-        print("FAIL: the same input was supplied more than once", file=sys.stderr)
+        print("error     the same input was supplied more than once", file=sys.stderr)
         return 2
     for label, root in (("work", args.work_dir), ("output", args.out_dir),
                         ("success", args.success_dir)):
@@ -2473,7 +2570,7 @@ def main(argv: list[str] | None = None) -> int:
         for protected, is_directory in protected_sources:
             if (resolved_root == protected
                     or (is_directory and protected in resolved_root.parents)):
-                print(f"FAIL: {label} directory overlaps input source: {root}",
+                print(f"error     {label} directory overlaps input source: {root}",
                       file=sys.stderr)
                 return 2
 
@@ -2484,35 +2581,38 @@ def main(argv: list[str] | None = None) -> int:
     title_keys = TitleKeys.load(args.title_keys)
     knowledge = CnmtKnowledgeBase(args.titledb / "cnmts.json")
     if knowledge.load_error:
-        print(f"WARNING: CNMTDB unavailable; continuing without its repair "
-              f"proposals: {knowledge.load_error}")
+        print_finding("CNMTDB unavailable; continuing without its repair "
+                      f"proposals: {knowledge.load_error}", indent="")
     firmware_catalog = load_firmware_catalog(DB_DIR / "firmware_versions.json")
     attempted = completed = failed = source_failures = archive_failures = 0
-    for source in inputs:
-        print(f"\n[{source.name}]")
+    source_complete = source_partial = source_rejected = 0
+    for source_index, source in enumerate(inputs, 1):
+        print(f"\nInput {source_index}/{len(inputs)}: {source.name}")
         try:
             container_type, extract_dir, input_warnings = prepare_input(
                 source, args.work_dir, args.keep_work)
-            print(f"  source:  {container_type}")
+            print(f"  input     {container_type}")
             for warning in input_warnings:
-                print(f"  WARNING: {warning}")
+                print_finding(warning)
             inspection = inspect_container(extract_dir, container_type, keys,
                                            knowledge, firmware_catalog)
             discovery = discover_groups(source, container_type, inspection, keys)
         except (FixError, OSError, ValueError, subprocess.SubprocessError) as exc:
             source_failures += 1
-            print(f"  FAIL:    {exc}")
+            source_rejected += 1
+            print(f"  error     {exc}")
+            print("  source    REJECTED — no output written; input retained")
             continue
 
         for warning in (*inspection.warnings, *discovery.warnings):
-            print(f"  WARNING: {warning}")
+            print_finding(warning)
         source_errors = (*inspection.errors, *discovery.errors)
         source_has_errors = bool(source_errors)
         if source_has_errors:
             source_failures += 1
             for detail in source_errors:
-                print(f"  FAIL:    source inventory: {detail}")
-        print(f"  groups:  {len(discovery.groups)} readable, "
+                print(f"  error     source inventory: {detail}")
+        print(f"  titles    {len(discovery.groups)} readable CNMT group(s), "
               f"{len(discovery.failed_attempts)} unreadable")
         source_attempted = source_completed = source_failed = 0
         for detail in discovery.failed_attempts:
@@ -2520,11 +2620,13 @@ def main(argv: list[str] | None = None) -> int:
             failed += 1
             source_attempted += 1
             source_failed += 1
-            print(f"  FAIL:    Meta/CNMT attempt failed: {detail}")
+            print(f"  error     unreadable Meta/CNMT: {detail}")
         if not discovery.groups and not discovery.failed_attempts:
             if not source_has_errors:
                 source_failures += 1
-            print("  FAIL:    container contains no readable Meta/CNMT NCA")
+            source_rejected += 1
+            print("  error     container contains no readable Meta/CNMT NCA")
+            print("  source    REJECTED — no output written; input retained")
             continue
 
         source_work = args.work_dir / source.name
@@ -2532,6 +2634,9 @@ def main(argv: list[str] | None = None) -> int:
             attempted += 1
             source_attempted += 1
             try:
+                info = group.meta.info
+                print(f"\n  [{index}/{len(discovery.groups)}] "
+                      f"{info.title_id.upper()} v{info.version} {info.type_name}")
                 group_work = source_work / f"group-{index:03d}"
                 plan = build_repair_plan(
                     group, group_work, keys, args.cert, title_keys)
@@ -2539,38 +2644,74 @@ def main(argv: list[str] | None = None) -> int:
                 if not plan.publishable:
                     failed += 1
                     source_failed += 1
+                    print("    result    REJECTED — no output written")
                     continue
                 if args.inspect_only:
                     verify_plan_integrity(plan, keys)
-                    print("  output:  inspect-only; not written")
+                    print(f"    result    {display_outcome(plan.outcome)} — "
+                          "inspect-only; no output written")
                 else:
                     output_dir = group_output_dir(args.out_dir, group, discovery.groups)
                     if output_dir != args.out_dir:
-                        print("  WARNING: distinct signed Meta variants share this release; "
-                              "staged separately under fixnsp-variants for manual selection")
+                        print("    warning   distinct signed Meta variants share this "
+                              "release; staged separately under fixnsp-variants for "
+                              "manual selection")
                     destination = execute_plan(plan, group_work, output_dir,
                                                keys, args.overwrite)
-                    print(f"  output:  {destination}")
+                    print(f"    result    {display_outcome(plan.outcome)} -> "
+                          f"{destination}")
                 completed += 1
                 source_completed += 1
             except (FixError, OSError, ValueError, subprocess.SubprocessError) as exc:
                 failed += 1
                 source_failed += 1
-                print(f"  FAIL:    group attempt failed: {exc}")
+                print(f"    result    REJECTED — {exc}; no output written")
 
+        source_archived = False
         if (not args.inspect_only and source_attempted > 0
                 and source_completed == source_attempted and source_failed == 0
                 and not source_has_errors):
             try:
                 archived, moved = archive_successful_source(source, args.success_dir)
-                print(f"  input:   {'moved' if moved else 'already archived'}: {archived}")
+                source_archived = True
+                print(f"  archive   {'moved' if moved else 'already archived'}: "
+                      f"{archived}")
             except (OSError, ValueError) as exc:
                 archive_failures += 1
-                print(f"  FAIL:    successful source could not be archived: {exc}")
+                print(f"  error     successful source could not be archived: {exc}")
 
-    print(f"\ndone: sources={len(inputs)}, attempted_groups={attempted}, "
-          f"completed_groups={completed}, failed_groups={failed}, "
-          f"source_failures={source_failures}, archive_failures={archive_failures}")
+        if args.inspect_only:
+            if (source_attempted > 0 and source_completed == source_attempted
+                    and source_failed == 0 and not source_has_errors):
+                source_complete += 1
+                print(f"  source    VERIFIED — {source_completed} group(s); "
+                      "input unchanged")
+            elif source_completed:
+                source_partial += 1
+                print(f"  source    PARTIAL — {source_completed} group(s) verified, "
+                      f"{source_failed} rejected; input unchanged")
+            else:
+                source_rejected += 1
+                print("  source    REJECTED — no group verified; input unchanged")
+        elif source_archived:
+            source_complete += 1
+            print(f"  source    COMPLETE — {source_completed} output(s) published; "
+                  "input archived")
+        elif source_completed:
+            source_partial += 1
+            print(f"  source    PARTIAL — {source_completed} output(s) published, "
+                  f"{source_failed} rejected; input retained")
+        else:
+            source_rejected += 1
+            print("  source    REJECTED — no output written; input retained")
+
+    print(f"\nSummary: {len(inputs)} source(s) — {source_complete} complete, "
+          f"{source_partial} partial, {source_rejected} rejected")
+    print(f"         {attempted} group(s) — {completed} completed, "
+          f"{failed} rejected")
+    if source_failures or archive_failures:
+        print(f"         processing errors: {source_failures}; "
+              f"archive errors: {archive_failures}")
     return 1 if failed or source_failures or archive_failures else 0
 
 
