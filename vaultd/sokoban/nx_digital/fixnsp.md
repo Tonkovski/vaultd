@@ -40,6 +40,16 @@ card capacity exceeds EOF is bounds-checked, not rejected; an XCI's firmware
 `update` partition is ignored. XCI is only a container source: admission is
 decided from the referenced NCA headers, never the input extension.
 
+An outer PFS0 whose structural header is readable but whose declared member
+extents cross EOF or overlap enters bounded salvage. Its names, offsets and
+sizes are carving hints only: stage solely members whose complete declared
+extents lie inside the physical file and overlap no sibling. Record every
+skipped member as a source-level error, then require the normal Nintendo NCA
+signature and signed-CNMT hash/size gates before a staged member may publish.
+The source remains in place even when an unrelated complete group publishes.
+Never shorten an entry to EOF, fill missing bytes, infer a boundary, or salvage
+an invalid header, unsafe/duplicate name, or ambiguous data region.
+
 A root HFS0 partition may declare unused trailing bytes beyond physical EOF.
 Accept this only after its nested HFS0 table, every declared member extent and
 all hashed regions are verified within the real file. Keep nested/leaf bounds

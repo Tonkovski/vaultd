@@ -111,6 +111,10 @@ class FixError(RuntimeError):
     pass
 
 
+class Pfs0ExtentError(FixError):
+    """The PFS0 header is readable, but one or more member extents are unsafe."""
+
+
 def configure_utf8_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -275,7 +279,8 @@ def safe_member_name(raw: bytes, index: int, kind: str) -> str:
     return name
 
 
-def read_pfs0_table(path: Path) -> list[Pfs0Entry]:
+def read_pfs0_layout(path: Path) -> tuple[int, list[Pfs0Entry]]:
+    """Read structurally valid PFS0 metadata without trusting member extents."""
     file_size = path.stat().st_size
     with path.open("rb") as handle:
         header = handle.read(0x10)
@@ -291,7 +296,6 @@ def read_pfs0_table(path: Path) -> list[Pfs0Entry]:
         data_offset = 0x10 + len(table) + len(strings)
 
     entries: list[Pfs0Entry] = []
-    ranges: list[tuple[int, int, str]] = []
     for index in range(count):
         relative, size, name_offset, entry_reserved = struct.unpack_from(
             "<QQII", table, index * 0x18)
@@ -302,21 +306,43 @@ def read_pfs0_table(path: Path) -> list[Pfs0Entry]:
             raise FixError(f"PFS0 name {index} is not null terminated")
         name = safe_member_name(strings[name_offset:end], index, "PFS0")
         absolute = data_offset + relative
-        stop = absolute + size
-        if absolute < data_offset or stop > file_size:
-            raise FixError(f"PFS0 file extends past EOF: {name}")
         entries.append(Pfs0Entry(name, absolute, size))
-        ranges.append((absolute, stop, name))
-    for left, right in zip(sorted(ranges), sorted(ranges)[1:]):
-        if left[1] > right[0]:
-            raise FixError(f"overlapping PFS0 entries: {left[2]} and {right[2]}")
     if len({entry.name.casefold() for entry in entries}) != len(entries):
         raise FixError("duplicate PFS0 file names")
+    return file_size, entries
+
+
+def pfs0_overlap_pairs(entries: list[Pfs0Entry]) -> list[tuple[int, int]]:
+    """Return enough pairs to cover every member in an overlap component."""
+    pairs: list[tuple[int, int]] = []
+    furthest_index: int | None = None
+    furthest_stop = -1
+    for index, entry in sorted(enumerate(entries), key=lambda item: item[1].offset):
+        if furthest_index is not None and entry.offset < furthest_stop:
+            pairs.append((furthest_index, index))
+        stop = entry.offset + entry.size
+        if stop > furthest_stop:
+            furthest_index, furthest_stop = index, stop
+    return pairs
+
+
+def read_pfs0_table(path: Path) -> list[Pfs0Entry]:
+    file_size, entries = read_pfs0_layout(path)
+    for entry in entries:
+        stop = entry.offset + entry.size
+        if stop > file_size:
+            raise Pfs0ExtentError(f"PFS0 file extends past EOF: {entry.name}")
+    overlaps = pfs0_overlap_pairs(entries)
+    if overlaps:
+        left, right = overlaps[0]
+        raise Pfs0ExtentError(
+            f"overlapping PFS0 entries: {entries[left].name} and "
+            f"{entries[right].name}")
     return entries
 
 
-def extract_pfs0(path: Path, out_dir: Path) -> list[Path]:
-    entries = read_pfs0_table(path)
+def extract_pfs0_entries(path: Path, out_dir: Path,
+                         entries: list[Pfs0Entry]) -> list[Path]:
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True)
@@ -329,6 +355,53 @@ def extract_pfs0(path: Path, out_dir: Path) -> list[Path]:
                 copy_exact(source, output, entry.size)
             extracted.append(destination)
     return extracted
+
+
+def extract_pfs0(path: Path, out_dir: Path) -> list[Path]:
+    return extract_pfs0_entries(path, out_dir, read_pfs0_table(path))
+
+
+def extract_pfs0_with_salvage(
+        path: Path, out_dir: Path,
+        ) -> tuple[list[Path], tuple[str, ...], tuple[str, ...]]:
+    """Salvage independently verifiable members from an extent-broken PFS0.
+
+    Structural metadata remains strict. Only declared extents that are wholly
+    inside the physical file and do not overlap another declared extent are
+    staged. Later NCA/CNMT inspection is the authority that may approve them.
+    """
+    try:
+        return extract_pfs0(path, out_dir), (), ()
+    except Pfs0ExtentError as strict_error:
+        strict_reason = str(strict_error)
+        file_size, entries = read_pfs0_layout(path)
+
+    unsafe: dict[int, list[str]] = {}
+    for index, entry in enumerate(entries):
+        stop = entry.offset + entry.size
+        if stop > file_size:
+            missing = stop - file_size
+            unsafe.setdefault(index, []).append(
+                f"declared extent exceeds EOF by {missing} byte(s)")
+
+    for left_index, right_index in pfs0_overlap_pairs(entries):
+        left, right = entries[left_index], entries[right_index]
+        unsafe.setdefault(left_index, []).append(
+            f"declared extent overlaps {right.name}")
+        unsafe.setdefault(right_index, []).append(
+            f"declared extent overlaps {left.name}")
+
+    safe_entries = [entry for index, entry in enumerate(entries)
+                    if index not in unsafe]
+    extracted = extract_pfs0_entries(path, out_dir, safe_entries)
+    warning = (
+        f"PFS0 extent salvage active after strict rejection ({strict_reason}); "
+        f"staged {len(safe_entries)} of {len(entries)} complete, "
+        "non-overlapping member(s) for independent verification")
+    errors = tuple(
+        f"PFS0 salvage skipped {entries[index].name}: {'; '.join(reasons)}"
+        for index, reasons in sorted(unsafe.items()))
+    return extracted, (warning,), errors
 
 
 def read_hfs0_table(path: Path, base_offset: int, container_size: int, *,
@@ -2039,12 +2112,11 @@ def rejoin_split_nsp(source_dir: Path, work: Path) -> Path:
         for item in parts:
             with item.open("rb") as chunk:
                 shutil.copyfileobj(chunk, output, 8 * 1024 * 1024)
-    read_pfs0_table(joined)
     return joined
 
 
 def prepare_input(source: Path, work_root: Path, keep_work: bool
-                  ) -> tuple[str, Path, tuple[str, ...]]:
+                  ) -> tuple[str, Path, tuple[str, ...], tuple[str, ...]]:
     suffix = source.suffix.lower()
     work = work_root / source.name
     resolved_source, resolved_work = source.resolve(), work.resolve()
@@ -2055,6 +2127,7 @@ def prepare_input(source: Path, work_root: Path, keep_work: bool
         shutil.rmtree(work)
     work.mkdir(parents=True, exist_ok=True)
     warnings: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()
     if source.is_dir() and suffix == ".nsp":
         nsp = rejoin_split_nsp(source, work / "rejoined")
         container_type = "NSP-SPLIT"
@@ -2070,12 +2143,13 @@ def prepare_input(source: Path, work_root: Path, keep_work: bool
             container_type = "XCZ"
         extract_dir = work / "extract"
         warnings = extract_xci(xci, extract_dir)
-        return container_type, extract_dir, warnings
+        return container_type, extract_dir, warnings, errors
     else:
         raise FixError(f"unsupported input type: {source.name}")
     extract_dir = work / "extract"
-    extract_pfs0(nsp, extract_dir)
-    return container_type, extract_dir, warnings
+    _, pfs0_warnings, pfs0_errors = extract_pfs0_with_salvage(nsp, extract_dir)
+    return (container_type, extract_dir, (*warnings, *pfs0_warnings),
+            (*errors, *pfs0_errors))
 
 
 def content_scope_paths(extract_dir: Path, container_type: str) -> tuple[Path, ...]:
@@ -2987,8 +3061,8 @@ def main(argv: list[str] | None = None) -> int:
     for source_index, source in enumerate(inputs, 1):
         print(f"\nInput {source_index}/{len(inputs)}: {source.name}")
         try:
-            container_type, extract_dir, input_warnings = prepare_input(
-                source, args.work_dir, args.keep_work)
+            container_type, extract_dir, input_warnings, input_errors = (
+                prepare_input(source, args.work_dir, args.keep_work))
             print(f"  input     {container_type}")
             for warning in input_warnings:
                 print_finding(warning)
@@ -3004,7 +3078,7 @@ def main(argv: list[str] | None = None) -> int:
 
         for warning in (*inspection.warnings, *discovery.warnings):
             print_finding(warning)
-        source_errors = (*inspection.errors, *discovery.errors)
+        source_errors = (*input_errors, *inspection.errors, *discovery.errors)
         source_has_errors = bool(source_errors)
         if source_has_errors:
             source_failures += 1

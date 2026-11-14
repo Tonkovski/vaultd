@@ -1,7 +1,9 @@
-"""NX digital keeper: ownership coverage report. Takes no arguments.
+"""NX digital keeper: targeted ownership coverage report.
 
-For every application group the vault owns anything of, reports gaps —
-anchored by the base application, regardless of artifact labels:
+Accepts one case-insensitive hexadecimal title id through ``--tid``. The id
+may name a base application, update or DLC; all resolve to the same application
+family. Reports only that family's missing members, regardless of artifact
+labels:
 
   BASE  owned or MISSING
   UPD   latest owned vs the newest version titledb knows (versions.json)
@@ -12,11 +14,10 @@ titledb is the sole gap source. The DLC catalog is the union of every
 title id titledb knows anywhere — cnmts.json keys, versions.json keys and
 the id fields of all region catalogs — because each source alone is
 partial (region catalogs list store ids cnmts never saw, and vice versa).
-Owned artifacts never appear, whatever their label. Healthy groups and
-healthy lines are hidden.
+Owned artifacts never appear, whatever their label. Healthy lines are hidden.
 
 hashdb is optional and is queried only to mint the [MIA] mark: a gap line
-earns it when the No-Intro dats hold no row for that title id (+version
+earns it when the DATVault hashdb holds no row for that title id (+version
 for updates) — missing in action from preservation itself, not merely
 from this vault. Without any dats the report still runs, minus the marks.
 
@@ -27,6 +28,7 @@ valid DLC ids in [aoc_base + 1, aoc_base + 2000].
 
 from __future__ import annotations
 
+import argparse
 import json
 import re
 import sys
@@ -130,21 +132,46 @@ def load_title_universe(titledb_dir: Path) -> set[str]:
     return universe
 
 
-def load_dat_index(dats: list[Path]) -> tuple[set[str], set[tuple[str, int]]]:
-    """(title ids, (title id, version) pairs) known to the No-Intro dats."""
+def load_dat_index(dats: list[Path], wanted: set[str]
+                   ) -> tuple[set[str], set[tuple[str, int]]]:
+    """Wanted title ids and versions known to the hashdb, streamed per game."""
     tids: set[str] = set()
     versions: set[tuple[str, int]] = set()
     for dat in dats:
-        for game in ET.parse(dat).getroot().iter("game"):
+        for _, game in ET.iterparse(dat, events=("end",)):
+            if game.tag != "game":
+                continue
             gid = game.findtext("game_id")
             if not gid:
+                game.clear()
                 continue
             gid = gid.strip().upper()
+            if gid not in wanted:
+                game.clear()
+                continue
             tids.add(gid)
             raw = (game.findtext("version1") or "").strip().lstrip("vV")
             if raw.isdigit():
                 versions.add((gid, int(raw)))
+            game.clear()
     return tids, versions
+
+
+def title_id(value: str) -> str:
+    if not re.fullmatch(r"[0-9A-Fa-f]{16}", value):
+        raise argparse.ArgumentTypeError(
+            "TID must be exactly 16 hexadecimal characters")
+    return value.upper()
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="nxlookup",
+        description="Report only missing members of one NX title family.")
+    parser.add_argument(
+        "--tid", required=True, type=title_id,
+        help="base, update or DLC title id (16 hexadecimal characters)")
+    return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -153,10 +180,9 @@ def main(argv: list[str] | None = None) -> int:
         if reconfigure is not None:
             reconfigure(encoding="utf-8", errors="replace")
     argv = sys.argv[1:] if argv is None else argv
-    if argv:
-        print("nxlookup takes no arguments (default behaviour only)",
-              file=sys.stderr)
-        return 2
+    args = parse_args(argv)
+    query_tid = args.tid
+    query_kind, app_id = classify(query_tid)
     try:
         vdir = locator.resolve([VAULT_NAME])[VAULT_NAME]
     except locator.LocatorError as exc:
@@ -175,19 +201,19 @@ def main(argv: list[str] | None = None) -> int:
     versions = json.loads(versions_path.read_text(encoding="utf-8"))
     names = display_titledb()
 
-    # ownership sweep: any fileshared in any release counts, labels ignored.
-    owned_base: dict[str, list[str]] = {}      # app id -> base versions
-    owned_upd: dict[str, list[int]] = {}       # app id -> update version ints
-    owned_dlc: dict[str, set[str]] = {}        # app id -> dlc tids owned
-    groups: set[str] = set()
+    # Target-family ownership: any fileshared in any release counts, labels ignored.
+    owned_base = False
+    owned_upd: set[int] = set()
+    owned_dlc: set[str] = set()
     for entity in cat.entities:
-        kind, app_id = classify(entity.identifier)
+        kind, entity_app_id = classify(entity.identifier)
+        if entity_app_id != app_id:
+            continue
         has_files = any(release.shared for release in entity.releases)
         if not has_files:
             continue
-        groups.add(app_id)
         if kind == "DLC":
-            owned_dlc.setdefault(app_id, set()).add(entity.identifier)
+            owned_dlc.add(entity.identifier)
             continue
         for release in entity.releases:
             if not release.shared:
@@ -195,73 +221,61 @@ def main(argv: list[str] | None = None) -> int:
             number = int(release.version.lstrip("v")) \
                 if release.version.lstrip("v").isdigit() else None
             if release.standalone:
-                owned_base.setdefault(app_id, []).append(release.version)
+                owned_base = True
             elif number is not None:
-                owned_upd.setdefault(app_id, []).append(number)
+                owned_upd.add(number)
 
-    # dats load lazily, once the first gap needs its verdict; absent dats
-    # degrade to a report without [MIA] marks, never to a failure.
-    dat_index: list[tuple[set[str], set[tuple[str, int]]] | None] = []
+    # Each tuple is (kind, tid, version-or-None, display suffix). Only missing
+    # entries are ever rendered.
+    missing: list[tuple[str, str, int | None, str]] = []
+    if not owned_base:
+        missing.append(("BASE", app_id, None, ""))
 
-    def mia(tid: str, version: int | None = None) -> str:
-        if not dat_index:
-            dats = sorted((DB_DIR / "hashdb").glob("*.xml"))
-            if not dats:
-                print("note: no hashdb dats found; [MIA] verdicts "
-                      "unavailable", file=sys.stderr)
-            dat_index.append(load_dat_index(dats) if dats else None)
-        if dat_index[0] is None:
-            return ""
-        tids, pairs = dat_index[0]
-        if version is not None:
-            known = (tid.upper(), version) in pairs
+    version_rows = versions.get(app_id.lower()) or {}
+    latest_known = max((int(key) for key in version_rows), default=None)
+    if latest_known is not None and latest_known not in owned_upd:
+        upd_tid = f"{int(app_id, 16) + PATCH_OFFSET:016X}"
+        released = version_rows[str(latest_known)]
+        missing.append(("UPD", upd_tid, latest_known, f" ({released})"))
+
+    known_dlc = dlc_ids_of(app_id, universe)
+    if query_kind == "DLC" and query_tid not in known_dlc:
+        known_dlc.append(query_tid)
+        known_dlc.sort()
+    for tid in known_dlc:
+        if tid not in owned_dlc:
+            dlc_name = names.query(tid)[0] or "(name unknown)"
+            missing.append(("DLC", tid, None, f" {dlc_name}"))
+
+    wanted = {tid for _, tid, _, _ in missing}
+    dats = sorted((DB_DIR / "hashdb").glob("*.xml")) if wanted else []
+    if dats:
+        dat_tids, dat_versions = load_dat_index(dats, wanted)
+    else:
+        dat_tids, dat_versions = set(), set()
+        if wanted:
+            print("note: no hashdb dats found; [MIA] verdicts unavailable",
+                  file=sys.stderr)
+
+    family_name = names.query(app_id)[0] or "(name unknown)"
+    query_label = "BASE" if query_kind == "APP" else query_kind
+    print(f"family: [{app_id}] {family_name}")
+    print(f"query:  [{query_tid}] {query_label}")
+    if not missing:
+        print("missing: none")
+        return 0
+
+    print("missing:")
+    for kind, tid, version, suffix in missing:
+        if version is None:
+            known = tid in dat_tids
+            identity = f"[{tid}]"
         else:
-            known = tid.upper() in tids
-        return "" if known else " [MIA]"
-
-    print(f"vault: {vdir}")
-    print(f"groups owned: {len(groups)}\n")
-    incomplete = 0
-    for app_id in sorted(groups):
-        # only problems print: healthy groups and healthy lines are hidden.
-        lines: list[str] = []
-
-        if not owned_base.get(app_id):
-            lines.append(f"  BASE  MISSING{mia(app_id)}")
-
-        version_rows = versions.get(app_id.lower()) or {}
-        latest_known = max((int(key) for key in version_rows), default=None)
-        have = max(owned_upd.get(app_id, []), default=None)
-        if latest_known is not None:
-            upd_tid = f"{int(app_id, 16) + PATCH_OFFSET:016X}"
-            if have is None:
-                lines.append(f"  UPD   MISSING: latest v{latest_known} "
-                             f"({version_rows[str(latest_known)]})"
-                             f"{mia(upd_tid, latest_known)}")
-            elif have < latest_known:
-                lines.append(f"  UPD   outdated: v{have} owned, latest "
-                             f"v{latest_known} ({version_rows[str(latest_known)]})"
-                             f"{mia(upd_tid, latest_known)}")
-
-        known_dlc = dlc_ids_of(app_id, universe)
-        owned = owned_dlc.get(app_id, set())
-        missing = [tid for tid in known_dlc if tid not in owned]
-        if missing:
-            lines.append(f"  DLC   {len(known_dlc) - len(missing)}"
-                         f"/{len(known_dlc)} owned; missing:")
-            for tid in missing:
-                dlc_name = names.query(tid)[0] or "(name unknown)"
-                lines.append(f"        [{tid}] {dlc_name}{mia(tid)}")
-
-        if lines:
-            incomplete += 1
-            name = names.query(app_id)[0] or "(name unknown)"
-            print(f"[{app_id}] {name}")
-            for line in lines:
-                print(line)
-            print()
-
-    print(f"done: {len(groups)} group(s), {incomplete} with gaps")
+            known = (tid, version) in dat_versions
+            identity = f"[{tid}][v{version}]"
+        mia = "" if known or not dats else " [MIA]"
+        print(f"  {kind:<4} {identity}{suffix}{mia}")
+    print(f"done: {len(missing)} missing")
     return 0
 
 
